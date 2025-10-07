@@ -1,0 +1,12 @@
+.{
+    .name = .zslsk,
+    .version = "0.0.0",
+    .fingerprint = 0x9375a0a014c4c731,
+    .minimum_zig_version = "0.15.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
