@@ -1,6 +1,10 @@
 const std = @import("std");
 const zslsk = @import("zslsk");
 
+// constants
+const HOST: []const u8 = "server.slsknet.org";
+const PORT: u16 = 2242;
+
 // zslsk test application entrypoint
 pub fn main() !void {
     // create general purpose allocator
@@ -12,7 +16,7 @@ pub fn main() !void {
     defer client.deinit();
 
     print("[info] attempting login\n", .{});
-    try client.connect("user", "pass");
+    try client.connect(HOST, PORT, "lzma", "nope");
 }
 
 // helper function to print to stdout
