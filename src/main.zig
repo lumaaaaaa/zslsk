@@ -15,8 +15,17 @@ pub fn main() !void {
     var client = zslsk.Client.init(gpa.allocator());
     defer client.deinit();
 
-    print("[info] attempting login\n", .{});
-    try client.connect(HOST, PORT, "lzma", "nope");
+    print("[input] username: ", .{});
+    const username = try readStdinLine(gpa.allocator());
+    print("[input] password: ", .{});
+    const password = try readStdinLine(gpa.allocator());
+
+    try client.connect(HOST, PORT, username, password);
+
+    print("[info] login successful. main thread will now sleep.\n", .{});
+    while (true) {
+        std.Thread.sleep(std.time.ns_per_s);
+    }
 }
 
 // helper function to print to stdout
@@ -30,4 +39,17 @@ fn print(comptime fmt: []const u8, args: anytype) void {
     stdout.flush() catch |err| {
         std.debug.print("Failed to flush stdout: .{}\n", .{err});
     };
+}
+
+/// helper function to read a single line from stdin
+pub fn readStdinLine(allocator: std.mem.Allocator) ![]const u8 {
+    var stdin_buffer: [64]u8 = undefined;
+    var stdin = std.fs.File.stdin().reader(&stdin_buffer);
+    const reader = &stdin.interface;
+
+    // read a line from stdin
+    const line = try reader.takeDelimiterExclusive('\n');
+
+    // return a copy
+    return allocator.dupe(u8, line);
 }
