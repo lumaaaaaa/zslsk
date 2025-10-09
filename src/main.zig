@@ -4,28 +4,32 @@ const zslsk = @import("zslsk");
 // constants
 const HOST: []const u8 = "server.slsknet.org";
 const PORT: u16 = 2242;
+const LISTEN_PORT: u16 = 22340;
 
 // zslsk test application entrypoint
 pub fn main() !void {
     // create general purpose allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
     // initialize zslsk client
-    var client = zslsk.Client.init(gpa.allocator());
+    var client = zslsk.Client.init(allocator);
     defer client.deinit();
 
     print("[input] username: ", .{});
-    const username = try readStdinLine(gpa.allocator());
+    const username = try readStdinLine(allocator);
+    defer allocator.free(username);
     print("[input] password: ", .{});
-    const password = try readStdinLine(gpa.allocator());
+    const password = try readStdinLine(allocator);
+    defer allocator.free(password);
 
-    try client.connect(HOST, PORT, username, password);
+    try client.connect(HOST, PORT, username, password, LISTEN_PORT);
 
-    print("[info] login successful. main thread will now sleep.\n", .{});
-    while (true) {
-        std.Thread.sleep(std.time.ns_per_s);
-    }
+    print("[info] login successful. main thread will now sleep. press ENTER to terminate.\n", .{});
+    _ = try readStdinLine(allocator);
+
+    print("[info] shutting down...", .{});
 }
 
 // helper function to print to stdout
