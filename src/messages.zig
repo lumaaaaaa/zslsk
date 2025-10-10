@@ -451,7 +451,7 @@ pub const PeerResponse = union(enum(u32)) {
 };
 
 /// Represents a Soulseek peer init message. These are generic. Enum value corresponds to the relevant message code.
-pub const PeerInitMessage = union(enum(u32)) {
+pub const PeerInitMessage = union(enum(u8)) {
     pierceFireWall: PierceFireWall = 0,
     peerInit: PeerInit = 1,
 

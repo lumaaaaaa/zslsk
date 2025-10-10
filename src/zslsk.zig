@@ -194,7 +194,7 @@ pub const Client = struct {
         switch (connection_type.?) {
             // p2p
             types.ConnectionType.P => |conn_type| {
-                std.log.debug("\tEstablishing P connection with {s} @ {d}.{d}.{d}.{d}:{d}...", .{
+                std.log.debug("Establishing indirect P connection with {s} @ {d}.{d}.{d}.{d}:{d}...", .{
                     msg.username,
                     msg.ip[0],
                     msg.ip[1],
@@ -213,8 +213,8 @@ pub const Client = struct {
                 // create PeerConnection
                 const peer = try PeerConnection.init(self.allocator, socket, msg.username, msg.token, conn_type, null, null);
 
-                // send PeerInit
-                //try peer.sendPeerInit();
+                // send PierceFireWall
+                try peer.sendPierceFireWall();
 
                 // add to peer map
                 self.peers_mutex.lock();
@@ -400,13 +400,12 @@ pub const PeerConnection = struct {
     }
 
     // public library functions //
-    pub fn sendPeerInit(self: *PeerConnection) !void {
-        const msg = messages.PeerInitMessage{
-            .username = self.username,
-            .type = @tagName(self.connection_type),
+    pub fn sendPierceFireWall(self: *PeerConnection) !void {
+        const msg = messages.PierceFireWall{
+            .token = self.token,
         };
 
-        try self.sendMessage(.{ .peerInit = msg });
+        try self.sendPeerInitMessage(.{ .pierceFireWall = msg });
     }
 
     pub fn beginReadLoop(self: *PeerConnection, client: *Client) !void {
