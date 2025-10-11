@@ -3,6 +3,9 @@ const messages = @import("messages.zig");
 const types = @import("types.zig");
 
 pub const Client = struct {
+    // constants //
+    const peerDialTimeoutMs: u64 = 5000;
+
     // properties //
     allocator: std.mem.Allocator,
     socket: ?std.net.Stream,
@@ -177,12 +180,46 @@ pub const Client = struct {
         };
     }
 
-    /// Message handler for ConnectToPeer
+    /// Esablishes a TCP connection, or returns error if the connection times out.
+    fn tcpConnectToAddressTimeout(address: std.net.Address, timeout_ms: u64) !std.net.Stream {
+        // create stream object
+        var socket: ?std.net.Stream = null;
+
+        // function to dial
+        const T = struct {
+            fn bgDial(sock: *?std.net.Stream, addr: std.net.Address) void {
+                sock.* = std.net.tcpConnectToAddress(addr) catch |err| {
+                    std.log.err("Could not establish TCP connection: {}", .{err});
+                    return;
+                };
+            }
+        };
+
+        // dial in background
+        var thread = try std.Thread.spawn(.{}, T.bgDial, .{ &socket, address });
+        defer thread.join();
+
+        // continue sleeping while socket disconnected, up to timeout
+        const check_interval = 10; // 10ms
+        var total_sleep: u64 = 0;
+        while (socket == null and total_sleep < timeout_ms) {
+            std.Thread.sleep(check_interval * std.time.ns_per_ms);
+            total_sleep += check_interval;
+        }
+
+        if (socket) |sock| {
+            return sock;
+        }
+
+        return error.DialTimeout;
+    }
+
+    /// Message handler for ConnectToPeer, establishes an indirect peer connection.
     fn handleConnectToPeer(self: *Client, msg: messages.ConnectToPeerResponse) !void {
         // check for existing p2p connection
-        self.peers_mutex.lockShared();
+        self.peers_mutex.lock(); // handleConnectToPeer and handleIncomingPeerConnection must not race
         const existing_conn = self.peer_connections.get(msg.username);
-        self.peers_mutex.unlockShared();
+        defer self.peers_mutex.unlock();
 
         if (existing_conn) |_| {
             std.log.debug("Connection to peer {s} already exists", .{msg.username});
@@ -205,8 +242,8 @@ pub const Client = struct {
 
                 // connect to host
                 const address = std.net.Address.initIp4(msg.ip, @intCast(msg.port));
-                const socket = std.net.tcpConnectToAddress(address) catch |err| {
-                    std.log.err("Could not establish P connection: {}", .{err});
+                const socket = tcpConnectToAddressTimeout(address, peerDialTimeoutMs) catch |err| {
+                    std.log.err("Timed out when connecting to peer: {}", .{err});
                     return err;
                 };
 
@@ -217,9 +254,7 @@ pub const Client = struct {
                 try peer.sendPierceFireWall();
 
                 // add to peer map
-                self.peers_mutex.lock();
                 try self.peer_connections.put(peer.username, peer);
-                self.peers_mutex.unlock();
 
                 // spawn thread for independent peer read loop
                 try peer.beginReadLoop(self);
@@ -281,6 +316,9 @@ pub const Client = struct {
 
     // Handles an incoming peer connection and adds a PeerConnection object to our peer_connections.
     fn handleIncomingPeerConnection(self: *Client, socket: std.net.Stream) !void {
+        self.peers_mutex.lock(); // handleConnectToPeer and handleIncomingPeerConnection must not race
+        defer self.peers_mutex.unlock();
+
         var buf: [65535]u8 = undefined;
         var reader = socket.reader(&buf);
 
@@ -303,9 +341,7 @@ pub const Client = struct {
         const peer = try PeerConnection.init(self.allocator, socket, msg.username, msg.token, std.meta.stringToEnum(types.ConnectionType, msg.type).?, reader, buf);
 
         // add to peer map
-        self.peers_mutex.lock();
         try self.peer_connections.put(peer.username, peer);
-        self.peers_mutex.unlock();
 
         // spawn thread for independent peer read loop
         try peer.beginReadLoop(self);

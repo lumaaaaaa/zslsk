@@ -7,6 +7,7 @@ pub const Message = union(enum(u32)) {
     setWaitPort: SetWaitPortMessage = 2,
     connectToPeer: ConnectToPeerMessage = 18,
     messageUser: MessageUserMessage = 22,
+    uploadSpeed: UploadSpeedMessage = 121,
 
     // Returns the relevant message code based on the enum value.
     pub fn code(self: Message) u32 {
@@ -86,6 +87,15 @@ pub const MessageUserMessage = struct {
     pub fn write(self: MessageUserMessage, writer: *std.Io.Writer) !void {
         try writeString(self.username, writer);
         try writeString(self.message, writer);
+    }
+};
+
+/// Represents server code 22, a message to represent a user direct message.
+pub const UploadSpeedMessage = struct {
+    speed: u32,
+
+    pub fn write(self: UploadSpeedMessage, writer: *std.Io.Writer) !void {
+        try writer.writeInt(u32, self.speed, .little);
     }
 };
 
