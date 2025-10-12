@@ -6,6 +6,11 @@ const HOST: []const u8 = "server.slsknet.org";
 const PORT: u16 = 2242;
 const LISTEN_PORT: u16 = 22340;
 
+const Command = enum {
+    userinfo,
+    exit, // exits the application
+};
+
 // zslsk test application entrypoint
 pub fn main() !void {
     // create general purpose allocator
@@ -26,8 +31,34 @@ pub fn main() !void {
 
     try client.connect(HOST, PORT, username, password, LISTEN_PORT);
 
-    print("[info] login successful. main thread will now sleep. press ENTER to terminate.\n", .{});
-    _ = try readStdinLine(allocator);
+    print("[info] login successful.\n", .{});
+    while (true) {
+        print("> ", .{});
+
+        const line = try readStdinLine(allocator);
+        defer allocator.free(line);
+
+        var it = std.mem.splitScalar(u8, line, ' ');
+        if (it.next()) |cmd_str| {
+            const cmd_or_null = std.meta.stringToEnum(Command, cmd_str);
+
+            if (cmd_or_null) |cmd| {
+                switch (cmd) {
+                    Command.userinfo => {
+                        const user_or_null = it.next();
+
+                        if (user_or_null) |user| {
+                            const user_info = try client.getUserInfo(user);
+                            print("{s}: {s}\n", .{ user, user_info.description });
+                        }
+                    },
+                    Command.exit => break,
+                }
+            } else {
+                print("Unknown command.\n", .{});
+            }
+        }
+    }
 
     print("[info] shutting down...", .{});
 }

@@ -5,6 +5,7 @@ const types = @import("types.zig");
 pub const Client = struct {
     // constants //
     const peerDialTimeoutMs: u64 = 5000;
+    const peerMsgTimeoutMs: u64 = 5000;
 
     // properties //
     allocator: std.mem.Allocator,
@@ -60,7 +61,7 @@ pub const Client = struct {
         if (self.server) |*server| server.deinit();
     }
 
-    // public library functions //
+    // API accessible to library consumers //
     /// Connects to a Soulseek server and authenticates with the supplied username and password. Additionally, this function will
     /// start the network thread to asynchronously process messages from server -> client.
     pub fn connect(self: *Client, hostname: []const u8, port: u16, username: []const u8, password: []const u8, listen_port: u16) !void {
@@ -132,6 +133,28 @@ pub const Client = struct {
         self.p2p_thread = try std.Thread.spawn(.{}, serverLoop, .{self});
 
         return;
+    }
+
+    pub fn getUserInfo(self: *Client, username: []const u8) !messages.UserInfoMessage {
+        // first, see if we need to establish a connection with this peer
+        self.peers_mutex.lockShared();
+        const existing_conn_or_null = self.peer_connections.get(username);
+        defer self.peers_mutex.unlockShared();
+
+        if (existing_conn_or_null == null) {
+            // we need to connect to this peer
+        }
+
+        // a connection is established at this point
+        const conn = existing_conn_or_null.?;
+
+        // send message to request peer's user info
+        try conn.sendPeerMessage(.{ .getUserInfo = messages.EmptyMessage{} });
+
+        // wait for a response
+        const response = try conn.user_info_slot.waitForResponse(peerMsgTimeoutMs);
+
+        return response;
     }
 
     // private internal functions //
@@ -394,11 +417,15 @@ pub const PeerConnection = struct {
     socket: std.net.Stream,
     socket_reader: std.net.Stream.Reader,
     read_buf: [65535]u8,
+    write_buf: [8192]u8,
     connection_type: types.ConnectionType,
 
     // peer info
     username: []const u8,
     token: u32,
+
+    // synchronous responses
+    user_info_slot: ResponseSlot(messages.UserInfoMessage),
 
     pub fn deinit(self: *PeerConnection) void {
         self.running.store(false, .seq_cst);
@@ -417,9 +444,11 @@ pub const PeerConnection = struct {
             .socket = socket,
             .socket_reader = undefined,
             .read_buf = undefined,
+            .write_buf = undefined,
             .connection_type = connection_type,
             .username = try allocator.dupe(u8, username),
             .token = token,
+            .user_info_slot = .{},
         };
 
         if (read_buf) |b| {
@@ -453,8 +482,7 @@ pub const PeerConnection = struct {
         // TODO: handle error when socket is closed
 
         // create buffered writer
-        var buf: [512]u8 = undefined;
-        var writer = self.socket.writer(&buf);
+        var writer = self.socket.writer(&self.write_buf);
         const writer_interface = &writer.interface;
         try msg.write(writer_interface);
         try writer_interface.flush();
@@ -464,25 +492,27 @@ pub const PeerConnection = struct {
         // TODO: handle error when socket is closed
 
         // create buffered writer
-        var buf: [512]u8 = undefined;
-        var writer = self.socket.writer(&buf);
+        var writer = self.socket.writer(&self.write_buf);
         const writer_interface = &writer.interface;
         try msg.write(writer_interface);
         try writer_interface.flush();
     }
 
-    fn readResponse(self: *PeerConnection) !messages.PeerResponse {
+    fn readResponse(self: *PeerConnection) !messages.PeerMessage {
         // get reader interface
         var reader_interface = self.socket_reader.interface();
 
         // parse message header
         const payload_len = try reader_interface.takeInt(u32, .little);
+        const start_seek = reader_interface.seek; // current_seek - start_seek < payload_len, keep parsing
         const message_code = try reader_interface.takeInt(u32, .little);
 
         // handoff to relevant parser
         return switch (message_code) {
             4 => .{ .getSharedFileList = try messages.EmptyMessage.parse(self.allocator, reader_interface) },
-            15 => .{ .userInfo = try messages.EmptyMessage.parse(self.allocator, reader_interface) },
+            5 => .{ .sharedFileList = try messages.SharedFileListMessage.parse(self.allocator, reader_interface) },
+            15 => .{ .getUserInfo = try messages.EmptyMessage.parse(self.allocator, reader_interface) },
+            16 => .{ .userInfo = try messages.UserInfoMessage.parse(self.allocator, reader_interface, start_seek, payload_len) },
             else => {
                 std.log.warn("Peer readResponse dropped an unknown message. code: {d}, length: {d}", .{ message_code, payload_len });
 
@@ -507,7 +537,10 @@ pub const PeerConnection = struct {
                 std.log.debug("err: {}", .{err});
                 continue;
             };
-            defer message.deinit(self.allocator);
+
+            // deinit message if it isn't returned
+            var should_deinit = true;
+            defer if (should_deinit) message.deinit(self.allocator);
 
             // handle async message types
             std.log.debug("== Received message: {s} (code: {d}) ==", .{ @tagName(message), message.code() });
@@ -522,7 +555,10 @@ pub const PeerConnection = struct {
                         continue;
                     };
                 },
-                .userInfo => {
+                .sharedFileList => {
+                    std.log.debug("\tReceived {s}'s file list (parsing unimplemented)", .{self.username});
+                },
+                .getUserInfo => {
                     std.log.debug("\t{s} requests our user info", .{self.username});
                     // TODO: implement some form of user profile properties to source this data from
                     const msg = messages.UserInfoMessage{
@@ -539,7 +575,50 @@ pub const PeerConnection = struct {
                     };
                     std.log.debug("Sent {s} our user info", .{self.username});
                 },
+                .userInfo => |msg| {
+                    std.log.debug("\tReceived {s}'s user info", .{self.username});
+                    should_deinit = false;
+                    // set response in user info response slot
+                    self.user_info_slot.setResponse(msg);
+                },
             }
         }
     }
 };
+
+// Type allowing for easy synchronous message handling.
+fn ResponseSlot(comptime T: type) type {
+    return struct {
+        mutex: std.Thread.Mutex = .{},
+        event: std.Thread.ResetEvent = .{},
+        response: ?T = null,
+
+        pub fn waitForResponse(self: *@This(), timeout_ms: ?u64) !T {
+            // clear event
+            self.event.reset();
+
+            if (timeout_ms) |timeout| {
+                // wait for event with timeout
+                try self.event.timedWait(timeout * std.time.ns_per_ms);
+            } else {
+                // no timeout specified, just wait for event
+                self.event.wait();
+            }
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const response = self.response orelse return error.NoResponse;
+            self.response = null; // clear slot
+            return response;
+        }
+
+        pub fn setResponse(self: *@This(), response: T) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            self.response = response;
+            self.event.set();
+        }
+    };
+}

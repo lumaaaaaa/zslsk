@@ -373,8 +373,16 @@ pub const ExcludedSearchPhrasesResponse = struct {
 
 /// Represents a Soulseek peer init message. These are generic. Enum value corresponds to the relevant message code.
 pub const PeerMessage = union(enum(u32)) {
+    getSharedFileList: EmptyMessage = 4,
     sharedFileList: SharedFileListMessage = 5,
+    getUserInfo: EmptyMessage = 15,
     userInfo: UserInfoMessage = 16,
+
+    pub fn deinit(self: *PeerMessage, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |*resp| resp.deinit(allocator),
+        }
+    }
 
     // Returns the relevant message code based on the enum value.
     pub fn code(self: PeerMessage) u32 {
@@ -411,6 +419,16 @@ pub const PeerMessage = union(enum(u32)) {
 pub const SharedFileListMessage = struct {
     data: []const u8,
 
+    pub fn deinit(self: *SharedFileListMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.data);
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !SharedFileListMessage {
+        return SharedFileListMessage{
+            .data = try readString(allocator, reader),
+        };
+    }
+
     pub fn write(self: SharedFileListMessage, writer: *std.Io.Writer) !void {
         try writeString(self.data, writer);
     }
@@ -432,6 +450,36 @@ pub const UserInfoMessage = struct {
         permitted_users = 3,
     };
 
+    pub fn deinit(self: *UserInfoMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.description);
+        if (self.picture) |p| allocator.free(p);
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader, start_seek: usize, payload_len: u32) !UserInfoMessage {
+        const description = try readString(allocator, reader);
+        const has_picture = (try reader.takeByte() == 1);
+        var picture: ?[]const u8 = null;
+        if (has_picture) {
+            picture = try readString(allocator, reader);
+        }
+        const total_upload = try reader.takeInt(u32, .little);
+        const queue_size = try reader.takeInt(u32, .little);
+        const slots_free = (try reader.takeByte() == 1);
+        var upload_permitted = UploadPermissions.everyone; // default to everyone
+        if (reader.seek - start_seek < payload_len) {
+            upload_permitted = @enumFromInt(try reader.takeInt(u32, .little));
+        }
+
+        return UserInfoMessage{
+            .description = description,
+            .picture = picture,
+            .total_upload = total_upload,
+            .queue_size = queue_size,
+            .slots_free = slots_free,
+            .upload_permitted = upload_permitted,
+        };
+    }
+
     pub fn write(self: UserInfoMessage, writer: *std.Io.Writer) !void {
         try writeString(self.description, writer);
         try writer.writeByte(@intFromBool(self.picture != null));
@@ -440,23 +488,6 @@ pub const UserInfoMessage = struct {
         try writer.writeInt(u32, self.queue_size, .little);
         try writer.writeByte(@intFromBool(self.slots_free));
         try writer.writeInt(u32, @intFromEnum(self.upload_permitted), .little);
-    }
-};
-
-/// Represents a Soulseek server response. Enum value corresponds to the relevant message code.
-pub const PeerResponse = union(enum(u32)) {
-    getSharedFileList: EmptyMessage = 4,
-    userInfo: EmptyMessage = 15,
-
-    // Returns the relevant message code based on the enum value.
-    pub fn code(self: PeerResponse) u32 {
-        return @intFromEnum(self);
-    }
-
-    pub fn deinit(self: *PeerResponse, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            inline else => |*resp| resp.deinit(allocator),
-        }
     }
 };
 
@@ -555,7 +586,7 @@ pub const EmptyMessage = struct {
         return EmptyMessage{};
     }
 
-    pub fn write(self: PeerInit, writer: *std.Io.Writer) !void {
+    pub fn write(self: EmptyMessage, writer: *std.Io.Writer) !void {
         _ = self;
         _ = writer;
     }
@@ -601,7 +632,7 @@ fn calcSize(msg: anytype) usize {
             .int => @sizeOf(field.type),
             .@"enum" => |e| @sizeOf(e.tag_type),
             .pointer => 4 + value.len, // we're gonna say this is a string, it's 4 (u32 len) + data.len
-            .optional => |opt| blk: {
+            .optional => |opt| 1 + blk: { // optionals are used when the protocol has an optional field. presence is denoted by bool, +1 byte
                 if (value) |v| {
                     break :blk switch (@typeInfo(opt.child)) {
                         .bool => 1, // bool is u8 in slsk protocol
