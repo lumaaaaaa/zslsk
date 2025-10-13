@@ -5,6 +5,7 @@ const types = @import("types.zig");
 pub const Message = union(enum(u32)) {
     login: LoginMessage = 1,
     setWaitPort: SetWaitPortMessage = 2,
+    getPeerAddress: GetPeerAddressMessage = 3,
     connectToPeer: ConnectToPeerMessage = 18,
     messageUser: MessageUserMessage = 22,
     uploadSpeed: UploadSpeedMessage = 121,
@@ -66,6 +67,15 @@ pub const SetWaitPortMessage = struct {
     }
 };
 
+/// Represents server code 3, a message to get the address of a peer.
+pub const GetPeerAddressMessage = struct {
+    username: []const u8,
+
+    pub fn write(self: GetPeerAddressMessage, writer: *std.Io.Writer) !void {
+        try writeString(self.username, writer);
+    }
+};
+
 /// Represents server code 18, a message to request connection to a peer.
 pub const ConnectToPeerMessage = struct {
     token: u32,
@@ -102,6 +112,7 @@ pub const UploadSpeedMessage = struct {
 /// Represents a Soulseek server response. Enum value corresponds to the relevant message code.
 pub const Response = union(enum(u32)) {
     login: LoginResponse = 1,
+    getPeerAddress: GetPeerAddressResponse = 3,
     connectToPeer: ConnectToPeerResponse = 18,
     messageUser: MessageUserResponse = 22,
     roomList: RoomListResponse = 64,
@@ -168,6 +179,29 @@ pub const LoginResponse = struct {
         }
 
         return response;
+    }
+};
+
+/// Represents a GetPeerAddress response.
+pub const GetPeerAddressResponse = struct {
+    username: []const u8,
+    ip: [4]u8,
+    port: u32,
+    obfuscation_type: u32,
+    obfuscated_port: u16,
+
+    pub fn deinit(self: *GetPeerAddressResponse, allocator: std.mem.Allocator) void {
+        allocator.free(self.username);
+    }
+
+    pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !GetPeerAddressResponse {
+        return GetPeerAddressResponse{
+            .username = try readString(allocator, reader),
+            .ip = try readIP(reader),
+            .port = try reader.takeInt(u32, .little),
+            .obfuscation_type = try reader.takeInt(u32, .little),
+            .obfuscated_port = try reader.takeInt(u16, .little),
+        };
     }
 };
 

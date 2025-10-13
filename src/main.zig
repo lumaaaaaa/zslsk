@@ -48,7 +48,10 @@ pub fn main() !void {
                         const user_or_null = it.next();
 
                         if (user_or_null) |user| {
-                            const user_info = try client.getUserInfo(user);
+                            const user_info = client.getUserInfo(user) catch |err| {
+                                std.log.debug("likely could not connect to user. error: {}", .{err});
+                                continue;
+                            };
                             print("{s}: {s}\n", .{ user, user_info.description });
                         }
                     },

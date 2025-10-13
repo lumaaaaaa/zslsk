@@ -5,7 +5,7 @@ const types = @import("types.zig");
 pub const Client = struct {
     // constants //
     const peerDialTimeoutMs: u64 = 5000;
-    const peerMsgTimeoutMs: u64 = 5000;
+    const msgTimeoutMs: u64 = 5000; // msg timeout for server and peers
 
     // properties //
     allocator: std.mem.Allocator,
@@ -16,10 +16,15 @@ pub const Client = struct {
     server: ?std.net.Server,
     running: std.atomic.Value(bool),
 
-    // p2p connections
+    // p2p connections //
     p2p_thread: ?std.Thread,
     peer_connections: std.StringHashMap(*PeerConnection),
     peers_mutex: std.Thread.RwLock,
+    token_to_username: std.AutoHashMap(u32, []const u8),
+    token_mutex: std.Thread.RwLock,
+
+    // synchronous responses //
+    get_peer_address_slot: ResponseSlot(messages.GetPeerAddressResponse),
 
     // initialization function //
     pub fn init(allocator: std.mem.Allocator) Client {
@@ -34,6 +39,9 @@ pub const Client = struct {
             .running = std.atomic.Value(bool).init(false),
             .peer_connections = std.StringHashMap(*PeerConnection).init(allocator),
             .peers_mutex = .{},
+            .token_to_username = std.AutoHashMap(u32, []const u8).init(allocator),
+            .token_mutex = .{},
+            .get_peer_address_slot = .{},
         };
     }
 
@@ -136,23 +144,14 @@ pub const Client = struct {
     }
 
     pub fn getUserInfo(self: *Client, username: []const u8) !messages.UserInfoMessage {
-        // first, see if we need to establish a connection with this peer
-        self.peers_mutex.lockShared();
-        const existing_conn_or_null = self.peer_connections.get(username);
-        defer self.peers_mutex.unlockShared();
-
-        if (existing_conn_or_null == null) {
-            // we need to connect to this peer
-        }
-
-        // a connection is established at this point
-        const conn = existing_conn_or_null.?;
+        // get the peer
+        const conn = try self.getPeer(username);
 
         // send message to request peer's user info
         try conn.sendPeerMessage(.{ .getUserInfo = messages.EmptyMessage{} });
 
         // wait for a response
-        const response = try conn.user_info_slot.waitForResponse(peerMsgTimeoutMs);
+        const response = try conn.user_info_slot.waitForResponse(msgTimeoutMs);
 
         return response;
     }
@@ -182,6 +181,7 @@ pub const Client = struct {
         // handoff to relevant parser
         return switch (message_code) {
             1 => .{ .login = try messages.LoginResponse.parse(reader_interface, self.allocator, payload_len) },
+            3 => .{ .getPeerAddress = try messages.GetPeerAddressResponse.parse(reader_interface, self.allocator) },
             18 => .{ .connectToPeer = try messages.ConnectToPeerResponse.parse(reader_interface, self.allocator) },
             22 => .{ .messageUser = try messages.MessageUserResponse.parse(reader_interface, self.allocator) },
             64 => .{ .roomList = try messages.RoomListResponse.parse(reader_interface, self.allocator) },
@@ -203,14 +203,103 @@ pub const Client = struct {
         };
     }
 
+    /// Gets existing PeerConnection, or establishes one if needed.
+    fn getPeer(self: *Client, username: []const u8) !*PeerConnection {
+        // first, see if we need to establish a connection with this peer
+        self.peers_mutex.lockShared();
+        const existing_conn_or_null = self.peer_connections.get(username);
+        self.peers_mutex.unlockShared();
+
+        if (existing_conn_or_null) |conn| return conn;
+        // we need to connect to this peer
+        // attempt a direct connection first
+
+        // request peer address
+        const get_peer_address_msg = messages.GetPeerAddressMessage{
+            .username = username,
+        };
+        try self.sendMessage(.{ .getPeerAddress = get_peer_address_msg });
+
+        // get server response
+        const get_peer_address_response = try self.get_peer_address_slot.waitForResponse(msgTimeoutMs);
+
+        // connect to host
+        const address = std.net.Address.initIp4(get_peer_address_response.ip, @intCast(get_peer_address_response.port));
+        const socket = tcpConnectToAddressTimeout(address, peerDialTimeoutMs) catch |err| {
+            std.log.debug("Timed out when connecting to peer: {}, attempting indirect...", .{err});
+
+            // peer listener port likely closed, tell them to connect to us
+            // first, generate a token
+            var prng = std.Random.DefaultPrng.init(blk: {
+                var seed: u64 = undefined;
+                try std.posix.getrandom(std.mem.asBytes(&seed));
+                break :blk seed;
+            });
+            const token = prng.random().int(u32);
+
+            // add kv to token -> username lookup map
+            self.token_mutex.lock();
+            try self.token_to_username.put(token, username);
+            self.token_mutex.unlock();
+
+            // send ConnectToPeer to the server
+            const connect_to_peer_msg = messages.ConnectToPeerMessage{
+                .token = token,
+                .type = "P",
+                .username = username,
+            };
+            try self.sendMessage(.{ .connectToPeer = connect_to_peer_msg });
+            std.log.debug("Sent ConnectToPeer to server for {s}", .{username});
+
+            // handler will establish connection if it comes in, wait til timeout for that
+            const check_interval = 10; // 10ms
+            var total_sleep: u64 = 0;
+            while (total_sleep < peerDialTimeoutMs) {
+                // check if connection has been made
+                self.peers_mutex.lockShared();
+                const new_conn_or_null = self.peer_connections.get(username);
+                self.peers_mutex.unlockShared();
+
+                if (new_conn_or_null) |conn| {
+                    return conn; // return established connection
+                }
+
+                std.Thread.sleep(check_interval * std.time.ns_per_ms);
+                total_sleep += check_interval;
+            }
+
+            return error.DialTimeout;
+        };
+
+        // create PeerConnection
+        const peer = try PeerConnection.init(self.allocator, socket, get_peer_address_response.username, 0, types.ConnectionType.P, null, null);
+
+        // send PeerInit
+        try peer.sendPeerInit(get_peer_address_response.username, types.ConnectionType.P);
+
+        // add to peer map
+        self.peers_mutex.lock();
+        try self.peer_connections.put(peer.username, peer);
+        self.peers_mutex.unlock();
+
+        // spawn thread for independent peer read loop
+        try peer.beginReadLoop(self);
+
+        std.log.debug("Connection established with {s}", .{get_peer_address_response.username});
+
+        return peer;
+    }
+
     /// Esablishes a TCP connection, or returns error if the connection times out.
     fn tcpConnectToAddressTimeout(address: std.net.Address, timeout_ms: u64) !std.net.Stream {
         // create stream object
         var socket: ?std.net.Stream = null;
+        var is_done = false;
 
         // function to dial
         const T = struct {
-            fn bgDial(sock: *?std.net.Stream, addr: std.net.Address) void {
+            fn bgDial(sock: *?std.net.Stream, addr: std.net.Address, done: *bool) void {
+                defer done.* = true; // tell waiting thread we've finished up
                 sock.* = std.net.tcpConnectToAddress(addr) catch |err| {
                     std.log.err("Could not establish TCP connection: {}", .{err});
                     return;
@@ -219,13 +308,13 @@ pub const Client = struct {
         };
 
         // dial in background
-        var thread = try std.Thread.spawn(.{}, T.bgDial, .{ &socket, address });
-        defer thread.join();
+        var thread = try std.Thread.spawn(.{}, T.bgDial, .{ &socket, address, &is_done });
+        defer if (is_done) thread.join() else thread.detach();
 
         // continue sleeping while socket disconnected, up to timeout
         const check_interval = 10; // 10ms
         var total_sleep: u64 = 0;
-        while (socket == null and total_sleep < timeout_ms) {
+        while (socket == null and total_sleep < timeout_ms and !is_done) {
             std.Thread.sleep(check_interval * std.time.ns_per_ms);
             total_sleep += check_interval;
         }
@@ -297,12 +386,21 @@ pub const Client = struct {
     fn readLoop(self: *Client) void {
         while (self.running.load(.seq_cst)) {
             var message = self.readResponse() catch continue;
-            defer message.deinit(self.allocator);
+
+            // deinit message if it isn't returned
+            var should_deinit = true;
+            defer if (should_deinit) message.deinit(self.allocator);
 
             // handle async message types
             std.log.debug("== Received message: {s} (code: {d}) ==", .{ @tagName(message), message.code() });
             switch (message) {
                 .login => continue, // do nothing, we handle logins just once, synchronously on connect
+                .getPeerAddress => |resp| {
+                    std.log.debug("\tReceived {s}'s address", .{resp.username});
+                    should_deinit = false;
+                    // set response in user info response slot
+                    self.get_peer_address_slot.setResponse(resp);
+                },
                 .connectToPeer => |resp| {
                     std.log.debug("\tP2P connection requested! {s} with address {d}.{d}.{d}.{d}:{d} wants connection type {s}, token {d}", .{
                         resp.username,
@@ -332,11 +430,6 @@ pub const Client = struct {
         }
     }
 
-    /// PeerInit is a special case of peer message. It's the only peer message readable outside of a PeerConnection.
-    fn readPeerInit(self: *Client, reader: *std.Io.Reader) !messages.PeerInit {
-        return try messages.PeerInit.parse(self.allocator, reader);
-    }
-
     // Handles an incoming peer connection and adds a PeerConnection object to our peer_connections.
     fn handleIncomingPeerConnection(self: *Client, socket: std.net.Stream) !void {
         self.peers_mutex.lock(); // handleConnectToPeer and handleIncomingPeerConnection must not race
@@ -352,16 +445,24 @@ pub const Client = struct {
         try reader_interface.discardAll(4); // we don't need the length for PeerInit
         const message_code = try reader_interface.takeByte();
 
-        // ensure this is a PeerInit message before we parse
-        if (message_code != 1) {
-            std.log.err("Expected PeerInit on incoming connection, instead got code {d}.", .{message_code});
+        // parse right message type, create PeerConnection
+        const peer = if (message_code == 0) blk: {
+            // indirect
+            const msg = try messages.PierceFireWall.parse(reader.interface());
+            self.token_mutex.lockShared();
+            const username = self.token_to_username.get(msg.token);
+            self.token_mutex.unlockShared();
+            break :blk if (username) |u|
+                try PeerConnection.init(self.allocator, socket, u, msg.token, types.ConnectionType.P, reader, buf)
+            else
+                return error.UnexpectedConnection;
+        } else if (message_code == 1) blk: {
+            // direct
+            const msg = try messages.PeerInit.parse(self.allocator, reader.interface());
+            break :blk try PeerConnection.init(self.allocator, socket, msg.username, msg.token, std.meta.stringToEnum(types.ConnectionType, msg.type).?, reader, buf);
+        } else {
             return error.UnknownMessage;
-        }
-
-        const msg = try self.readPeerInit(reader.interface());
-
-        // create PeerConnection
-        const peer = try PeerConnection.init(self.allocator, socket, msg.username, msg.token, std.meta.stringToEnum(types.ConnectionType, msg.type).?, reader, buf);
+        };
 
         // add to peer map
         try self.peer_connections.put(peer.username, peer);
@@ -369,7 +470,7 @@ pub const Client = struct {
         // spawn thread for independent peer read loop
         try peer.beginReadLoop(self);
 
-        std.log.debug("Connection established with {s}", .{msg.username});
+        std.log.debug("Connection established with {s}", .{peer.username});
     }
 
     /// Peer-to-peer server loop. Accepts connections and adds them to
@@ -429,8 +530,8 @@ pub const PeerConnection = struct {
 
     pub fn deinit(self: *PeerConnection) void {
         self.running.store(false, .seq_cst);
-        if (self.thread) |thread| thread.join();
         self.socket.close();
+        if (self.thread) |thread| thread.detach(); // detach, called by dying thread
         self.allocator.free(self.username);
     }
 
@@ -465,6 +566,15 @@ pub const PeerConnection = struct {
     }
 
     // public library functions //
+    pub fn sendPeerInit(self: *PeerConnection, username: []const u8, connection_type: types.ConnectionType) !void {
+        const msg = messages.PeerInit{
+            .username = username,
+            .type = @tagName(connection_type),
+        };
+
+        try self.sendPeerInitMessage(.{ .peerInit = msg });
+    }
+
     pub fn sendPierceFireWall(self: *PeerConnection) !void {
         const msg = messages.PierceFireWall{
             .token = self.token,
