@@ -8,6 +8,7 @@ pub const Message = union(enum(u32)) {
     getPeerAddress: GetPeerAddressMessage = 3,
     connectToPeer: ConnectToPeerMessage = 18,
     messageUser: MessageUserMessage = 22,
+    messageAcked: MessageAckedMessage = 23,
     uploadSpeed: UploadSpeedMessage = 121,
 
     // Returns the relevant message code based on the enum value.
@@ -97,6 +98,15 @@ pub const MessageUserMessage = struct {
     pub fn write(self: MessageUserMessage, writer: *std.Io.Writer) !void {
         try writeString(self.username, writer);
         try writeString(self.message, writer);
+    }
+};
+
+/// Represents server code 23, a message to acknowledge receipt of a user direct message.
+pub const MessageAckedMessage = struct {
+    message_id: u32,
+
+    pub fn write(self: MessageAckedMessage, writer: *std.Io.Writer) !void {
+        try writer.writeInt(u32, self.message_id, .little);
     }
 };
 

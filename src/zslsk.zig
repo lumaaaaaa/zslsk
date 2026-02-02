@@ -235,6 +235,18 @@ pub const Client = struct {
                 },
                 .messageUser => |resp| {
                     std.log.info("\tPrivate chat received | {s}: {s}", .{ resp.username, resp.message });
+
+                    // construct acknowledgement message
+                    const message_acked_msg = messages.MessageAckedMessage{
+                        .message_id = resp.id,
+                    };
+
+                    // send to server
+                    self.sendMessage(rt, .{ .messageAcked = message_acked_msg }) catch |err| {
+                        std.log.err("Could not send private chat acknowledgement: {}", .{err});
+                    };
+
+                    std.log.debug("Acknowledged private chat receipt", .{});
                 },
                 .roomList => |resp| std.log.debug("\tRoom counts: {d} total, {d} owned private, {d} unowned private, {d} operated private", .{ resp.rooms.capacity, resp.owned_private_rooms.capacity, resp.unowned_private_rooms.capacity, resp.operated_private_rooms.capacity }),
                 .privilegedUsers => |resp| std.log.debug("\tPrivileged user count: {d}", .{resp.users.capacity}), // just print for now
