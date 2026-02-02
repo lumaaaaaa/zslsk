@@ -19,7 +19,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
 
     // initialize zslsk client
-    var client = zslsk.Client.init(allocator);
+    var client = try zslsk.Client.init(allocator);
     defer client.deinit();
 
     print("[input] username: ", .{});

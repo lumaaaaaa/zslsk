@@ -3,9 +3,18 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const zio = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("zslsk", .{
         .root_source_file = b.path("src/zslsk.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "zio", .module = zio.module("zio") },
+        },
     });
 
     const exe = b.addExecutable(.{
