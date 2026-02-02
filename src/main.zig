@@ -8,7 +8,8 @@ const PORT: u16 = 2242;
 const LISTEN_PORT: u16 = 22340;
 
 const Command = enum {
-    userinfo,
+    msg, // sends a message to a target user (ex. msg <username> <content>)
+    userinfo, // retrieves user info for a target username (ex. userinfo <username>)
     exit, // exits the application
 };
 
@@ -66,21 +67,41 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
 
             if (cmd_or_null) |cmd| {
                 switch (cmd) {
-                    Command.userinfo => {
-                        const user_or_null = it.next();
+                    Command.msg => {
+                        const user = it.next() orelse {
+                            print(rt, "[error] syntax: msg <username> <content>\n", .{});
+                            continue;
+                        };
 
-                        if (user_or_null) |user| {
-                            const user_info = client.getUserInfo(rt, user) catch |err| {
-                                std.log.debug("likely could not connect to user. error: {}", .{err});
-                                continue;
-                            };
-                            print(rt, "{s}: {s}\n", .{ user, user_info.description });
+                        const content = it.rest();
+                        if (content.len == 0) {
+                            print(rt, "[error] syntax: msg <username> <content>\n", .{});
+                            continue;
                         }
+
+                        client.messageUser(rt, user, content) catch |err| {
+                            std.log.err("Could not send message to user: {}", .{err});
+                            continue;
+                        };
+                        print(rt, "Message sent.\n", .{});
+                    },
+                    Command.userinfo => {
+                        const user = it.next() orelse {
+                            print(rt, "[error] syntax: userinfo <username>\n", .{});
+                            continue;
+                        };
+
+                        const user_info = client.getUserInfo(rt, user) catch |err| {
+                            std.log.err("likely could not connect to user. error: {}", .{err});
+                            continue;
+                        };
+
+                        print(rt, "{s}: {s}\n", .{ user, user_info.description });
                     },
                     Command.exit => break,
                 }
             } else {
-                print(rt, "Unknown command.\n", .{});
+                print(rt, "[error] unknown command.\n", .{});
             }
         }
     }

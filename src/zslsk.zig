@@ -93,26 +93,6 @@ pub const Client = struct {
             std.log.debug("Login successful. {s}", .{login_response.login.greeting.?});
         }
 
-        // listen for p2p connections
-        const listen_addr = try zio.net.IpAddress.parseIp4("0.0.0.0", listen_port);
-        self.p2p_server = try listen_addr.listen(rt, .{});
-        std.log.debug("Listening for P2P connections on client public IPv4: {d}.{d}.{d}.{d}:{d}", .{
-            login_response.login.ip_address.?[0],
-            login_response.login.ip_address.?[1],
-            login_response.login.ip_address.?[2],
-            login_response.login.ip_address.?[3],
-            listen_port,
-        });
-
-        // advertise port to server
-        const set_wait_port_msg = messages.SetWaitPortMessage{
-            .port = listen_port,
-        };
-
-        std.log.debug("Sending message to advertise P2P port...", .{});
-        try self.sendMessage(rt, .{ .setWaitPort = set_wait_port_msg });
-        std.log.debug("Advertised P2P port successfully.", .{});
-
         // we're connected!
         self.connection_state.store(.connected, .seq_cst);
 
@@ -121,10 +101,11 @@ pub const Client = struct {
         self.peer_group = &peer_group;
         defer self.peer_group.?.cancel(rt);
 
-        try self.peer_group.?.spawn(rt, p2pListenerTask, .{ self, rt }); // p2p listener
+        _ = listen_port;
+        //try self.peer_group.?.spawn(rt, p2pListenerTask, .{ self, rt, listen_port }); // p2p listener
 
         // begin read loop
-        self.readLoop(rt, &reader); // FIX: something lol
+        self.readLoop(rt, &reader);
 
         self.peer_group.?.wait(rt) catch {};
     }
@@ -136,6 +117,18 @@ pub const Client = struct {
 
         // get user info
         return try conn.getUserInfo(rt);
+    }
+
+    /// Sends a direct message to a user through the centralized server.
+    pub fn messageUser(self: *Client, rt: *zio.Runtime, username: []const u8, text: []const u8) !void {
+        // construct message
+        const message_user_msg = messages.MessageUserMessage{
+            .username = username,
+            .message = text,
+        };
+
+        // send to server
+        try self.sendMessage(rt, .{ .messageUser = message_user_msg });
     }
 
     pub fn getPeerAddress(self: *Client, rt: *zio.Runtime, username: []const u8) !messages.GetPeerAddressResponse {
@@ -165,7 +158,23 @@ pub const Client = struct {
 
     /// Internal Library Functions ///
     // P2P listener.
-    fn p2pListenerTask(self: *Client, rt: *zio.Runtime) void {
+    fn p2pListenerTask(self: *Client, rt: *zio.Runtime, listen_port: u16) void {
+        // listen for p2p connections
+        const listen_addr = try zio.net.IpAddress.parseIp4("0.0.0.0", listen_port);
+        self.p2p_server = try listen_addr.listen(rt, .{});
+        std.log.debug("Listening for P2P connections on port {d}", .{
+            listen_port,
+        });
+
+        // advertise port to server
+        const set_wait_port_msg = messages.SetWaitPortMessage{
+            .port = listen_port,
+        };
+
+        std.log.debug("Sending message to advertise P2P port...", .{});
+        try self.sendMessage(rt, .{ .setWaitPort = set_wait_port_msg });
+        std.log.debug("Advertised P2P port successfully.", .{});
+
         while (self.connection_state.load(.seq_cst) == .connected) {
             const stream = self.p2p_server.?.accept(rt) catch |err| {
                 std.log.warn("P2P accept error: {}", .{err});
@@ -469,6 +478,7 @@ pub const PeerConnection = struct {
         }
 
         // handshake done, good to go
+        std.log.debug("Handshake complete with {s}, beginning read loop", .{self.username});
         self.connection_state.store(.connected, .seq_cst);
 
         // begin read loop
