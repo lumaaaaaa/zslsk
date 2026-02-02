@@ -1,5 +1,6 @@
 const std = @import("std");
 const zslsk = @import("zslsk");
+const zio = @import("zio");
 
 // constants
 const HOST: []const u8 = "server.slsknet.org";
@@ -18,24 +19,45 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
+    // create zio runtime
+    var rt = try zio.Runtime.init(allocator, .{ .thread_pool = .{} });
+    defer rt.deinit();
+
+    print(rt, "[input] username: ", .{});
+    const username = try readStdinLine(rt, allocator);
+    defer allocator.free(username);
+    print(rt, "[input] password: ", .{});
+    const password = try readStdinLine(rt, allocator);
+    defer allocator.free(password);
+
     // initialize zslsk client
     var client = try zslsk.Client.init(allocator);
     defer client.deinit();
 
-    print("[input] username: ", .{});
-    const username = try readStdinLine(allocator);
-    defer allocator.free(username);
-    print("[input] password: ", .{});
-    const password = try readStdinLine(allocator);
-    defer allocator.free(password);
+    // run application inside zio runtime
+    var task = try rt.spawn(app, .{ rt, &client, allocator, username, password });
+    try task.join(rt);
 
-    try client.connect(HOST, PORT, username, password, LISTEN_PORT);
+    print(rt, "[info] shutting down...", .{});
+}
 
-    print("[info] login successful.\n", .{});
+fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, username: []const u8, password: []const u8) !void {
+    var client_group: zio.Group = .init;
+    defer client_group.cancel(rt);
+
+    try client_group.spawn(rt, runClient, .{ client, rt, username, password });
+
+    // kinda a hack, but sleep without blocking the runtime to allow connection to become established
+    while (client.connection_state.load(.seq_cst) != .connected) {
+        try rt.sleep(.fromMilliseconds(10));
+    }
+
+    print(rt, "[info] login successful.\n", .{});
+
     while (true) {
-        print("> ", .{});
+        print(rt, "> ", .{});
 
-        const line = try readStdinLine(allocator);
+        const line = try readStdinLine(rt, allocator);
         defer allocator.free(line);
 
         var it = std.mem.splitScalar(u8, line, ' ');
@@ -48,45 +70,51 @@ pub fn main() !void {
                         const user_or_null = it.next();
 
                         if (user_or_null) |user| {
-                            const user_info = client.getUserInfo(user) catch |err| {
+                            const user_info = client.getUserInfo(rt, user) catch |err| {
                                 std.log.debug("likely could not connect to user. error: {}", .{err});
                                 continue;
                             };
-                            print("{s}: {s}\n", .{ user, user_info.description });
+                            print(rt, "{s}: {s}\n", .{ user, user_info.description });
                         }
                     },
                     Command.exit => break,
                 }
             } else {
-                print("Unknown command.\n", .{});
+                print(rt, "Unknown command.\n", .{});
             }
         }
     }
-
-    print("[info] shutting down...", .{});
 }
 
-// helper function to print to stdout
-fn print(comptime fmt: []const u8, args: anytype) void {
+/// Begins running the client.
+fn runClient(client: *zslsk.Client, rt: *zio.Runtime, username: []const u8, password: []const u8) void {
+    client.run(rt, HOST, PORT, username, password, LISTEN_PORT) catch |err| {
+        std.log.err("Client error: {}", .{err});
+    };
+}
+
+/// Helper function to non-blocking print to stdout.
+fn print(rt: *zio.Runtime, comptime fmt: []const u8, args: anytype) void {
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
-    stdout.print(fmt, args) catch |err| {
+    var stdout_writer = zio.File.fromFd(std.posix.STDOUT_FILENO).writer(rt, &stdout_buffer);
+    const writer_interface = &stdout_writer.interface;
+
+    writer_interface.print(fmt, args) catch |err| {
         std.debug.print("Failed to print string to stdout: .{}\n", .{err});
     };
-    stdout.flush() catch |err| {
+    writer_interface.flush() catch |err| {
         std.debug.print("Failed to flush stdout: .{}\n", .{err});
     };
 }
 
-/// helper function to read a single line from stdin
-pub fn readStdinLine(allocator: std.mem.Allocator) ![]const u8 {
-    var stdin_buffer: [64]u8 = undefined;
-    var stdin = std.fs.File.stdin().reader(&stdin_buffer);
-    const reader = &stdin.interface;
+/// Helper function to non-blocking read a single line from stdin.
+pub fn readStdinLine(rt: *zio.Runtime, allocator: std.mem.Allocator) ![]const u8 {
+    var stdin_buffer: [128]u8 = undefined;
+    var stdin_reader = zio.File.fromFd(std.posix.STDIN_FILENO).reader(rt, &stdin_buffer);
+    const reader_interface = &stdin_reader.interface;
 
     // read a line from stdin
-    const line = try reader.takeDelimiterExclusive('\n');
+    const line = try reader_interface.takeDelimiterExclusive('\n');
 
     // return a copy
     return allocator.dupe(u8, line);

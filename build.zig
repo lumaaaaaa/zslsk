@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "zio", .module = zio.module("zio") },
                 .{ .name = "zslsk", .module = mod },
             },
         }),

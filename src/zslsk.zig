@@ -12,138 +12,52 @@ pub const ConnectionState = enum(u8) {
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
-    rt: ?*zio.Runtime, // async I/O runtime
-    thread: ?std.Thread, // background thread for library
     connection_state: std.atomic.Value(ConnectionState) = std.atomic.Value(ConnectionState).init(.disconnected), // connection state
     socket: ?zio.net.Stream, // socket connection to centralized server
     p2p_server: ?zio.net.Server, // server listening for p2p connections
     peers: std.StringHashMap(*PeerConnection), // established peer connections
     peers_mutex: std.Thread.Mutex = .{},
+    own_username: ?[]const u8,
 
-    // key-based request-response waiters
-    user_info_waiters: std.StringHashMap(*zio.Channel(messages.UserInfoMessage)),
-    get_peer_address_waiters: std.StringHashMap(*zio.Channel(messages.GetPeerAddressResponse)),
-    waiter_mutex: std.Thread.Mutex = .{},
+    // group for peer task execution
+    peer_group: ?*zio.Group,
+
+    // oneshot channels for request-response, keyed by username for concurrency
+    get_peer_address_channels: std.StringHashMap(*zio.Channel(messages.GetPeerAddressResponse)),
+    waiters_mutex: std.Thread.Mutex = .{},
 
     /// Exported Library Functions ///
     pub fn init(allocator: std.mem.Allocator) !Client {
         return .{
             .allocator = allocator,
-            .rt = null,
-            .thread = null,
             .socket = null,
             .p2p_server = null,
             .peers = std.StringHashMap(*PeerConnection).init(allocator),
-            .user_info_waiters = std.StringHashMap(*zio.Channel(messages.UserInfoMessage)).init(allocator),
-            .get_peer_address_waiters = std.StringHashMap(*zio.Channel(messages.GetPeerAddressResponse)).init(allocator),
+            .own_username = null,
+            .peer_group = null,
+            .get_peer_address_channels = std.StringHashMap(*zio.Channel(messages.GetPeerAddressResponse)).init(allocator),
         };
     }
 
     pub fn deinit(self: *Client) void {
         // disconnect
         self.connection_state.store(.disconnected, .seq_cst);
-        if (self.rt) |rt| rt.deinit();
-
-        // join background thread
-        if (self.thread) |t| t.join();
+        if (self.own_username) |username| self.allocator.free(username);
     }
 
-    /// Connects and authenticates with a Soulseek server. Begins the async runtime on a background thread.
-    pub fn connect(self: *Client, hostname: []const u8, port: u16, username: []const u8, password: []const u8, listen_port: u16) !void {
-        self.thread = try std.Thread.spawn(.{}, backgroundThread, .{ self, hostname, port, username, password, listen_port });
-    }
+    /// Connects and authenticates with a Soulseek server. Begins the async runtime.
+    pub fn run(self: *Client, rt: *zio.Runtime, hostname: []const u8, port: u16, username: []const u8, password: []const u8, listen_port: u16) !void {
+        // store own username
+        self.own_username = username;
 
-    /// TODO: make this work (eventually) blocked by p2p
-    pub fn getUserInfo(self: *Client, username: []const u8) !messages.UserInfoMessage {
-        // create oneshot channel for username
-        var one: [1]messages.UserInfoMessage = undefined;
-        var channel = zio.Channel(messages.UserInfoMessage).init(&one);
-        defer channel.close(.immediate); // FIX: .immediate may cause problems i do not know
-
-        // add channel to user info waiter map
-        self.waiter_mutex.lock();
-        try self.user_info_waiters.put(username, &channel); // clobbers existing
-        self.waiter_mutex.unlock();
-
-        // defer waiter map cleanup
-        defer {
-            self.waiter_mutex.lock();
-            defer self.waiter_mutex.unlock();
-            _ = self.user_info_waiters.remove(username);
-        }
-
-        // send user info request
-        //const get_peer_address_msg = messages.UserInfoMessage{
-
-        //};
-        //try self.sendMessage(.{ .getPeerAddress = get_peer_address_msg });
-
-        // receive response
-        //const get_peer_address_resp = try channel.receive(self.rt);
-
-        //return messages.UserInfoMessage{
-        //    .description = get_peer_address_resp.description,
-        //    .picture = "",
-        //    .queue_size = get_peer_address_resp,
-        //    .slots_free = false,
-        //    .total_upload = 0,
-        //    .upload_permitted = get_peer_address_resp.,
-        //};
-        return messages.UserInfoMessage{
-            .description = "",
-            .picture = "",
-            .queue_size = 0,
-            .slots_free = true,
-            .total_upload = 0,
-            .upload_permitted = .everyone,
-        };
-    }
-
-    /// Internal Library Functions ///
-    // Background thread hosting the Zio runtime.
-    fn backgroundThread(self: *Client, hostname: []const u8, port: u16, username: []const u8, password: []const u8, listen_port: u16) !void {
-        // init zio runtime
-        var rt = zio.Runtime.init(self.allocator, .{
-            .thread_pool = .{},
-        }) catch |err| {
-            std.log.err("Failed to init runtime: {}", .{err});
-            self.connection_state.store(.failed, .seq_cst);
-            return;
-        };
-        defer rt.deinit();
-
-        self.rt = rt;
-        defer {
-            self.rt = null;
-        }
-
-        // dispatch main task
-        var task = self.rt.?.spawn(mainTask, .{ self, hostname, port, username, password, listen_port }) catch |err| {
-            std.log.err("Failed to spawn: {}", .{err});
-            self.connection_state.store(.failed, .seq_cst);
-            return;
-        };
-
-        // if the task completes, we have been disconnected from the server
-        task.join(self.rt.?) catch {};
-        task.getResult() catch |err| {
-            std.log.err("Main task exited with error: {}", .{err});
-        };
-
-        self.connection_state.store(.disconnected, .seq_cst);
-        std.log.err("Disconnected from server.", .{});
-    }
-
-    // Main task executed by the Zio runtime.
-    fn mainTask(self: *Client, hostname: []const u8, port: u16, username: []const u8, password: []const u8, listen_port: u16) !void {
         // connect to server
         std.log.debug("Establishing TCP connection to host {s}:{d}...", .{ hostname, port });
-        self.socket = try zio.net.tcpConnectToHost(self.rt.?, hostname, port, .{ .timeout = .none });
+        self.socket = try zio.net.tcpConnectToHost(rt, hostname, port, .{ .timeout = .none });
         std.log.debug("TCP connection successful.", .{});
 
         // initialize socket reader and writer
         var read_buf: [4096]u8 = undefined;
-        var reader = self.socket.?.reader(self.rt.?, &read_buf);
+        var reader = self.socket.?.reader(rt, &read_buf);
 
         // hash credentials
         var md5 = std.crypto.hash.Md5.init(.{});
@@ -164,7 +78,7 @@ pub const Client = struct {
         };
 
         std.log.debug("Sending login message to server...", .{});
-        try self.sendMessage(.{ .login = login_msg });
+        try self.sendMessage(rt, .{ .login = login_msg });
         std.log.debug("Sent login message successfully.", .{});
 
         // authentication step 2 (receive login message)
@@ -181,7 +95,7 @@ pub const Client = struct {
 
         // listen for p2p connections
         const listen_addr = try zio.net.IpAddress.parseIp4("0.0.0.0", listen_port);
-        self.p2p_server = try listen_addr.listen(self.rt.?, .{});
+        self.p2p_server = try listen_addr.listen(rt, .{});
         std.log.debug("Listening for P2P connections on client public IPv4: {d}.{d}.{d}.{d}:{d}", .{
             login_response.login.ip_address.?[0],
             login_response.login.ip_address.?[1],
@@ -196,33 +110,68 @@ pub const Client = struct {
         };
 
         std.log.debug("Sending message to advertise P2P port...", .{});
-        try self.sendMessage(.{ .setWaitPort = set_wait_port_msg });
+        try self.sendMessage(rt, .{ .setWaitPort = set_wait_port_msg });
         std.log.debug("Advertised P2P port successfully.", .{});
 
         // we're connected!
         self.connection_state.store(.connected, .seq_cst);
 
         // dispatch concurrent tasks
-        var group: zio.Group = .init;
-        defer group.cancel(self.rt.?);
+        var peer_group: zio.Group = .init;
+        self.peer_group = &peer_group;
+        defer self.peer_group.?.cancel(rt);
 
-        try group.spawn(self.rt.?, p2pListenerTask, .{self}); // p2p listener
+        try self.peer_group.?.spawn(rt, p2pListenerTask, .{ self, rt }); // p2p listener
 
         // begin read loop
-        self.readLoop(&reader);
+        self.readLoop(rt, &reader); // FIX: something lol
+
+        self.peer_group.?.wait(rt) catch {};
     }
 
-    // P2P listener.
-    fn p2pListenerTask(self: *Client) void {
-        var peer_group: zio.Group = .init;
-        defer peer_group.cancel(self.rt.?);
+    /// Gets user info of the user with the specified username.
+    pub fn getUserInfo(self: *Client, rt: *zio.Runtime, username: []const u8) !messages.UserInfoMessage {
+        // get the peer
+        const conn = try self.getPeer(rt, username);
 
+        // get user info
+        return try conn.getUserInfo(rt);
+    }
+
+    pub fn getPeerAddress(self: *Client, rt: *zio.Runtime, username: []const u8) !messages.GetPeerAddressResponse {
+        // create oneshot channel for request-response
+        var one: [1]messages.GetPeerAddressResponse = undefined;
+        var channel = zio.Channel(messages.GetPeerAddressResponse).init(&one);
+        defer channel.close(.graceful);
+
+        // register
+        self.waiters_mutex.lock();
+        try self.get_peer_address_channels.put(username, &channel);
+        self.waiters_mutex.unlock();
+
+        // unregister on exit
+        defer {
+            self.waiters_mutex.lock();
+            _ = self.get_peer_address_channels.remove(username);
+            self.waiters_mutex.unlock();
+        }
+
+        // request peer address
+        try self.sendMessage(rt, .{ .getPeerAddress = messages.GetPeerAddressMessage{ .username = username } });
+
+        // block until we receive a response
+        return channel.receive(rt);
+    }
+
+    /// Internal Library Functions ///
+    // P2P listener.
+    fn p2pListenerTask(self: *Client, rt: *zio.Runtime) void {
         while (self.connection_state.load(.seq_cst) == .connected) {
-            const stream = self.p2p_server.?.accept(self.rt.?) catch |err| {
+            const stream = self.p2p_server.?.accept(rt) catch |err| {
                 std.log.warn("P2P accept error: {}", .{err});
                 continue;
             };
-            errdefer stream.close(self.rt.?);
+            errdefer stream.close(rt);
 
             std.log.debug("Incoming P2P connection from {f}", .{stream.socket.address});
             //try peer_group.spawn(rt, handleIncomingPeer, .{ self, rt, stream });
@@ -230,11 +179,7 @@ pub const Client = struct {
     }
 
     // Server read loop.
-    fn readLoop(self: *Client, reader: *zio.net.Stream.Reader) void {
-        // group for synchronous operations
-        var group: zio.Group = .init;
-        defer group.cancel(self.rt.?);
-
+    fn readLoop(self: *Client, rt: *zio.Runtime, reader: *zio.net.Stream.Reader) void {
         while (self.connection_state.load(.seq_cst) == .connected) {
             var message = self.readResponse(reader) catch |err| {
                 if (err == error.EndOfStream) break;
@@ -254,8 +199,8 @@ pub const Client = struct {
                     should_deinit = false;
 
                     // send response in corresponding user info oneshot channel
-                    if (self.get_peer_address_waiters.get(resp.username)) |channel| {
-                        channel.send(self.rt.?, resp) catch |err| {
+                    if (self.get_peer_address_channels.get(resp.username)) |channel| {
+                        channel.send(rt, resp) catch |err| {
                             std.log.err("Could not send GetPeerAddressResponse in oneshot channel: {}", .{err});
                         };
                     }
@@ -273,9 +218,11 @@ pub const Client = struct {
                     });
                     should_deinit = false;
 
-                    group.spawn(self.rt.?, handleConnectToPeer, .{ self, resp }) catch |err| {
-                        std.log.err("Could not spawn thread to handle ConnectToPeer message: {}", .{err});
-                    };
+                    if (self.peer_group) |group| {
+                        group.spawn(rt, handleConnectToPeer, .{ self, rt, resp }) catch |err| {
+                            std.log.err("Could not spawn thread to handle ConnectToPeer message: {}", .{err});
+                        };
+                    }
                 },
                 .messageUser => |resp| {
                     std.log.info("\tPrivate chat received | {s}: {s}", .{ resp.username, resp.message });
@@ -291,7 +238,7 @@ pub const Client = struct {
     }
 
     // Message handler for ConnectToPeer, establishes an indirect peer connection.
-    fn handleConnectToPeer(self: *Client, resp: messages.ConnectToPeerResponse) void {
+    fn handleConnectToPeer(self: *Client, rt: *zio.Runtime, resp: messages.ConnectToPeerResponse) void {
         var msg = resp;
         defer msg.deinit(self.allocator);
 
@@ -310,37 +257,16 @@ pub const Client = struct {
         switch (connection_type.?) {
             // p2p
             types.ConnectionType.P => |conn_type| {
-                std.log.debug("Establishing indirect P connection with {s} @ {d}.{d}.{d}.{d}:{d}...", .{
-                    msg.username,
-                    msg.ip[0],
-                    msg.ip[1],
-                    msg.ip[2],
-                    msg.ip[3],
-                    msg.port,
-                });
-
-                // connect to host
-                const address = zio.net.IpAddress.initIp4(msg.ip, @intCast(msg.port));
-                const socket = zio.net.tcpConnectToAddress(self.rt.?, address, .{ .timeout = .{ .duration = .fromSeconds(20) } }) catch |err| { // TODO: move connect timeout to constant
-                    std.log.err("Timed out when connecting to peer: {}", .{err});
+                // connect to peer
+                const peer = self.createPeerConnection(rt, msg.ip, @intCast(msg.port), msg.username, msg.token, conn_type) catch |err| {
+                    std.log.err("Error connecting to peer: {}", .{err});
                     return;
                 };
 
-                // create PeerConnection
-                const peer = PeerConnection.init(self.allocator, self.rt.?, socket, msg.username, msg.token, conn_type) catch |err| {
-                    std.log.err("Could not initialize PeerConnection: {}", .{err});
-                    return;
+                // spawn peer and run
+                self.spawnPeer(rt, peer, false) catch |err| {
+                    std.log.err("Error spawning & running peer: {}", .{err});
                 };
-
-                // add to peer map
-                self.peers_mutex.lock();
-                self.peers.put(peer.username, peer) catch |err| {
-                    std.log.err("Could not add PeerConnection to peers map: {}", .{err});
-                };
-                self.peers_mutex.unlock();
-
-                // run peer and block
-                peer.run(true);
             },
             types.ConnectionType.F => {
                 // file transfer
@@ -351,13 +277,87 @@ pub const Client = struct {
         }
     }
 
+    // Gets an existing PeerConnection, or establishes one if needed.
+    fn getPeer(self: *Client, rt: *zio.Runtime, username: []const u8) !*PeerConnection {
+        // first, see if we need to establish a connection with this peer
+        self.peers_mutex.lock();
+        const existing_conn_or_null = self.peers.get(username);
+        self.peers_mutex.unlock();
+
+        if (existing_conn_or_null) |conn| return conn;
+        // we need to connect to this peer
+        // attempt a direct connection first
+
+        // request peer address
+        const get_peer_address_resp = try self.getPeerAddress(rt, username);
+
+        // connect to peer
+        const peer = try self.createPeerConnection(rt, get_peer_address_resp.ip, @intCast(get_peer_address_resp.port), username, 0, .P);
+
+        // spawn peer and run
+        try self.spawnPeer(rt, peer, true);
+
+        return peer;
+    }
+
+    // Creates a peer connection and registers it. Does NOT start the read loop.
+    fn createPeerConnection(self: *Client, rt: *zio.Runtime, ip: [4]u8, port: u16, username: []const u8, token: u32, connection_type: types.ConnectionType) !*PeerConnection {
+        std.log.debug("Establishing {s} connection with {s} @ {d}.{d}.{d}.{d}:{d}...", .{
+            @tagName(connection_type),
+            username,
+            ip[0],
+            ip[1],
+            ip[2],
+            ip[3],
+            port,
+        });
+
+        // connect to host
+        const address = zio.net.IpAddress.initIp4(ip, port);
+        const socket = try zio.net.tcpConnectToAddress(rt, address, .{
+            .timeout = .{ .duration = .fromSeconds(20) },
+        });
+
+        errdefer socket.close(rt);
+
+        // create PeerConnection
+        const peer = try PeerConnection.init(self.allocator, socket, username, self.own_username.?, token, connection_type);
+        errdefer peer.deinit(rt);
+
+        // add to peer map
+        self.peers_mutex.lock();
+        try self.peers.put(peer.username, peer);
+        self.peers_mutex.unlock();
+
+        return peer;
+    }
+
+    // Spawns peer and begins running.
+    fn spawnPeer(self: *Client, rt: *zio.Runtime, peer: *PeerConnection, we_initiated: bool) !void {
+        if (self.peer_group) |group| {
+            try group.spawn(rt, runPeer, .{ self, rt, peer, we_initiated });
+        } else {
+            return error.NotConnected;
+        }
+    }
+
+    // Runs the peer.
+    fn runPeer(self: *Client, rt: *zio.Runtime, peer: *PeerConnection, we_initiated: bool) void {
+        defer {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            _ = self.peers.remove(peer.username);
+        }
+        peer.run(rt, we_initiated);
+    }
+
     // Sends a message to the connected server.
-    fn sendMessage(self: *Client, msg: messages.Message) !void {
+    fn sendMessage(self: *Client, rt: *zio.Runtime, msg: messages.Message) !void {
         // TODO: handle error when socket is closed
 
         // create buffered writer
         var write_buf: [4096]u8 = undefined;
-        var writer = self.socket.?.writer(self.rt.?, &write_buf);
+        var writer = self.socket.?.writer(rt, &write_buf);
         const writer_interface = &writer.interface;
 
         // write message & flush
@@ -401,13 +401,13 @@ pub const Client = struct {
 
 pub const PeerConnection = struct {
     allocator: std.mem.Allocator,
-    rt: *zio.Runtime,
     username: []const u8,
+    own_username: []const u8,
     token: u32,
     connection_type: types.ConnectionType,
     socket: zio.net.Stream,
 
-    // key-based request-response waiters
+    // oneshot channels for request-response
     user_info_channel: ?*zio.Channel(messages.UserInfoMessage) = null,
 
     // mutex for channel access
@@ -416,13 +416,13 @@ pub const PeerConnection = struct {
     // connection state
     connection_state: std.atomic.Value(ConnectionState) = std.atomic.Value(ConnectionState).init(.disconnected),
 
-    pub fn init(allocator: std.mem.Allocator, rt: *zio.Runtime, socket: zio.net.Stream, username: []const u8, token: u32, connection_type: types.ConnectionType) !*PeerConnection {
+    pub fn init(allocator: std.mem.Allocator, socket: zio.net.Stream, username: []const u8, own_username: []const u8, token: u32, connection_type: types.ConnectionType) !*PeerConnection {
         const pc = try allocator.create(PeerConnection);
         pc.* = .{
             .allocator = allocator,
-            .rt = rt,
             .socket = socket,
             .username = try allocator.dupe(u8, username),
+            .own_username = try allocator.dupe(u8, own_username),
             .token = token,
             .connection_type = connection_type,
             .connection_state = std.atomic.Value(ConnectionState).init(.connecting),
@@ -430,44 +430,80 @@ pub const PeerConnection = struct {
         return pc;
     }
 
-    pub fn deinit(self: *PeerConnection) void {
+    pub fn deinit(self: *PeerConnection, rt: *zio.Runtime) void {
         self.connection_state.store(.disconnected, .seq_cst);
         self.allocator.free(self.username);
-        self.socket.close(self.rt);
+        self.allocator.free(self.own_username);
+        self.socket.close(rt);
     }
 
     // Self-contained peer connection logic.
-    pub fn run(self: *PeerConnection, we_initiated: bool) void {
-        defer self.deinit();
+    pub fn run(self: *PeerConnection, rt: *zio.Runtime, we_initiated: bool) void {
+        defer self.deinit(rt);
 
         // reader for socket
         var read_buf: [4096]u8 = undefined;
-        var reader = self.socket.reader(self.rt, &read_buf);
+        var reader = self.socket.reader(rt, &read_buf);
 
         // send correct handshake
         if (we_initiated) {
+            const msg = messages.PeerInit{
+                .username = self.own_username,
+                .type = @tagName(self.connection_type),
+                .token = 0,
+            };
+
+            self.sendPeerInitMessage(rt, .{ .peerInit = msg }) catch |err| {
+                std.log.err("Failed to send PeerInit to {s}: {}", .{ self.username, err });
+                return;
+            };
+        } else {
             const msg = messages.PierceFireWall{
                 .token = self.token,
             };
 
-            self.sendPeerInitMessage(.{ .pierceFireWall = msg }) catch |err| {
+            self.sendPeerInitMessage(rt, .{ .pierceFireWall = msg }) catch |err| {
                 std.log.err("Failed to send PierceFirewall to {s}: {}", .{ self.username, err });
-                return;
-            };
-        } else {
-            const msg = messages.PeerInit{
-                .username = self.username,
-                .type = @tagName(self.connection_type),
-            };
-
-            self.sendPeerInitMessage(.{ .peerInit = msg }) catch |err| {
-                std.log.err("Failed to send PeerInit to {s}: {}", .{ self.username, err });
                 return;
             };
         }
 
+        // handshake done, good to go
+        self.connection_state.store(.connected, .seq_cst);
+
         // begin read loop
-        self.readLoop(&reader);
+        self.readLoop(rt, &reader);
+    }
+
+    // Gets the connected peer's user info.
+    pub fn getUserInfo(self: *PeerConnection, rt: *zio.Runtime) !messages.UserInfoMessage {
+        // wait for handshake
+        while (self.connection_state.load(.seq_cst) != .connected) {
+            try rt.sleep(.fromMilliseconds(1));
+        }
+
+        // create oneshot channel for request-response
+        var one: [1]messages.UserInfoMessage = undefined;
+        var channel = zio.Channel(messages.UserInfoMessage).init(&one);
+        defer channel.close(.graceful);
+
+        // register
+        self.channels_mutex.lock();
+        self.user_info_channel = &channel;
+        self.channels_mutex.unlock();
+
+        // unregister on exit
+        defer {
+            self.channels_mutex.lock();
+            self.user_info_channel = null;
+            self.channels_mutex.unlock();
+        }
+
+        // request user info
+        try self.sendPeerMessage(rt, .{ .getUserInfo = .{} });
+
+        // block until we receive a response
+        return channel.receive(rt);
     }
 
     // Peer message handler.
@@ -499,7 +535,7 @@ pub const PeerConnection = struct {
     }
 
     // Peer read loop.
-    fn readLoop(self: *PeerConnection, reader: *zio.net.Stream.Reader) void {
+    fn readLoop(self: *PeerConnection, rt: *zio.Runtime, reader: *zio.net.Stream.Reader) void {
         while (self.connection_state.load(.seq_cst) == .connected) {
             var message = self.readResponse(reader) catch |err| {
                 if (err == error.EndOfStream) {
@@ -522,7 +558,7 @@ pub const PeerConnection = struct {
                     const msg = messages.SharedFileListMessage{
                         .data = "",
                     };
-                    self.sendPeerMessage(.{ .sharedFileList = msg }) catch |err| {
+                    self.sendPeerMessage(rt, .{ .sharedFileList = msg }) catch |err| {
                         std.log.err("Failed sending file list: {}", .{err});
                         continue;
                     };
@@ -541,7 +577,7 @@ pub const PeerConnection = struct {
                         .total_upload = 420,
                         .upload_permitted = .everyone,
                     };
-                    self.sendPeerMessage(.{ .userInfo = msg }) catch |err| {
+                    self.sendPeerMessage(rt, .{ .userInfo = msg }) catch |err| {
                         std.log.err("Failed sending user info: {}", .{err});
                         continue;
                     };
@@ -550,32 +586,37 @@ pub const PeerConnection = struct {
                 .userInfo => |msg| {
                     std.log.debug("\tReceived {s}'s user info", .{self.username});
                     should_deinit = false;
-                    // TODO: respond in corresponding oneshot
-                    _ = msg;
+
+                    // send response in oneshot channel, if someone is waiting
+                    if (self.user_info_channel) |channel| {
+                        channel.send(rt, msg) catch |err| {
+                            std.log.debug("Error sending user info response in oneshot channel: {}", .{err});
+                        };
+                    }
                 },
             }
         }
     }
 
     // Sends one of the PeerInit messages: PierceFireWall or PeerInit.
-    fn sendPeerInitMessage(self: *PeerConnection, msg: messages.PeerInitMessage) !void {
+    fn sendPeerInitMessage(self: *PeerConnection, rt: *zio.Runtime, msg: messages.PeerInitMessage) !void {
         // TODO: handle error when socket is closed
 
         // create buffered writer
         var write_buf: [4096]u8 = undefined;
-        var writer = self.socket.writer(self.rt, &write_buf);
+        var writer = self.socket.writer(rt, &write_buf);
         const writer_interface = &writer.interface;
         try msg.write(writer_interface);
         try writer_interface.flush();
     }
 
     // Sends a PeerMessage to the peer.
-    fn sendPeerMessage(self: *PeerConnection, msg: messages.PeerMessage) !void {
+    fn sendPeerMessage(self: *PeerConnection, rt: *zio.Runtime, msg: messages.PeerMessage) !void {
         // TODO: handle error when socket is closed
 
         // create buffered writer
         var write_buf: [4096]u8 = undefined;
-        var writer = self.socket.writer(self.rt, &write_buf);
+        var writer = self.socket.writer(rt, &write_buf);
         const writer_interface = &writer.interface;
         try msg.write(writer_interface);
         try writer_interface.flush();
