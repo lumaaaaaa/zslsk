@@ -110,7 +110,7 @@ pub const MessageAckedMessage = struct {
     }
 };
 
-/// Represents server code 22, a message to represent a user direct message.
+/// Represents server code 121, a message to report our upload speed.
 pub const UploadSpeedMessage = struct {
     speed: u32,
 
@@ -461,21 +461,115 @@ pub const PeerMessage = union(enum(u32)) {
 
 /// Represents peer code 5, a message containing files shared by a client.
 pub const SharedFileListMessage = struct {
-    data: []const u8,
+    directories: []SharedDirectory,
 
     pub fn deinit(self: *SharedFileListMessage, allocator: std.mem.Allocator) void {
-        allocator.free(self.data);
+        for (self.directories) |*dir| {
+            dir.deinit(allocator);
+        }
+        allocator.free(self.directories);
     }
 
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !SharedFileListMessage {
+        // message is zlib compressed
+        var buf: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompressor = std.compress.flate.Decompress.init(reader, .zlib, &buf);
+
+        const dir_count = try decompressor.reader.takeInt(u32, .little);
+        const directories = try allocator.alloc(SharedDirectory, dir_count);
+        errdefer allocator.free(directories);
+
+        for (directories) |*dir| {
+            dir.* = try SharedDirectory.parse(allocator, &decompressor.reader);
+            errdefer dir.deinit(allocator);
+        }
+
         return SharedFileListMessage{
-            .data = try readString(allocator, reader),
+            .directories = directories,
         };
     }
 
     pub fn write(self: SharedFileListMessage, writer: *std.Io.Writer) !void {
-        try writeString(self.data, writer);
+        // blocked by zlib compress, wait for Zig 0.16.0
+        _ = self;
+        _ = writer;
+        return error.Unimplemented;
     }
+};
+
+/// Represents metadata for a shared directory. Used in SharedFileListMessage.
+pub const SharedDirectory = struct {
+    name: []const u8,
+    files: []SharedFile,
+
+    pub fn deinit(self: *SharedDirectory, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        for (self.files) |*file| {
+            file.deinit(allocator);
+        }
+        allocator.free(self.files);
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !SharedDirectory {
+        const name = try readString(allocator, reader);
+        const file_count = try reader.takeInt(u32, .little);
+        const files = try allocator.alloc(SharedFile, file_count);
+        errdefer allocator.free(files);
+
+        for (files) |*file| {
+            file.* = try SharedFile.parse(allocator, reader);
+            errdefer file.deinit(allocator);
+        }
+
+        return SharedDirectory{
+            .name = name,
+            .files = files,
+        };
+    }
+};
+
+/// Represents metadata for a shared file. Used in SharedDirectory.
+pub const SharedFile = struct {
+    code: u8,
+    name: []const u8,
+    size: u64,
+    extension: []const u8,
+    attributes: []FileAttributes,
+
+    pub fn deinit(self: *SharedFile, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.extension);
+        allocator.free(self.attributes);
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !SharedFile {
+        const code = try reader.takeByte();
+        const name = try readString(allocator, reader);
+        const size = try reader.takeInt(u64, .little);
+        const extension = try readString(allocator, reader);
+        const attribute_count = try reader.takeInt(u32, .little);
+        const attributes = try allocator.alloc(FileAttributes, attribute_count);
+        errdefer allocator.free(attributes);
+
+        for (attributes) |*attribute| {
+            attribute.*.code = try reader.takeInt(u32, .little);
+            attribute.*.value = try reader.takeInt(u32, .little);
+        }
+
+        return SharedFile{
+            .code = code,
+            .name = name,
+            .size = size,
+            .extension = extension,
+            .attributes = attributes,
+        };
+    }
+};
+
+/// Represents attributes a SharedFile might have.
+pub const FileAttributes = struct {
+    code: u32,
+    value: u32,
 };
 
 /// Represents peer code 16, a message containing rich user information.

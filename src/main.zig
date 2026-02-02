@@ -8,6 +8,7 @@ const PORT: u16 = 2242;
 const LISTEN_PORT: u16 = 22340;
 
 const Command = enum {
+    filelist, // retrieves file list for a target username (ex. filelist <username>)
     msg, // sends a message to a target user (ex. msg <username> <content>)
     userinfo, // retrieves user info for a target username (ex. userinfo <username>)
     exit, // exits the application
@@ -67,6 +68,25 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
 
             if (cmd_or_null) |cmd| {
                 switch (cmd) {
+                    Command.filelist => {
+                        const user = it.next() orelse {
+                            print(rt, "[error] syntax: filelist <username>\n", .{});
+                            continue;
+                        };
+
+                        var file_list = client.getSharedFileList(rt, user) catch |err| {
+                            std.log.err("Could not get shared file list: {}", .{err});
+                            continue;
+                        };
+                        defer file_list.deinit(allocator);
+
+                        for (file_list.directories) |*dir| {
+                            if (dir.files.len > 0) print(rt, "{s}\n", .{dir.name});
+                            for (dir.files) |*file| {
+                                print(rt, "  {s} ({d} bytes)\n", .{ file.name, file.size });
+                            }
+                        }
+                    },
                     Command.msg => {
                         const user = it.next() orelse {
                             print(rt, "[error] syntax: msg <username> <content>\n", .{});
@@ -91,10 +111,11 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                             continue;
                         };
 
-                        const user_info = client.getUserInfo(rt, user) catch |err| {
+                        var user_info = client.getUserInfo(rt, user) catch |err| {
                             std.log.err("likely could not connect to user. error: {}", .{err});
                             continue;
                         };
+                        defer user_info.deinit(allocator);
 
                         print(rt, "{s}: {s}\n", .{ user, user_info.description });
                     },

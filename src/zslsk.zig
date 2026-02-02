@@ -119,6 +119,15 @@ pub const Client = struct {
         return try conn.getUserInfo(rt);
     }
 
+    /// Gets shared file list of the user with the specified username.
+    pub fn getSharedFileList(self: *Client, rt: *zio.Runtime, username: []const u8) !messages.SharedFileListMessage {
+        // get the peer
+        const conn = try self.getPeer(rt, username);
+
+        // get user info
+        return try conn.getSharedFileList(rt);
+    }
+
     /// Sends a direct message to a user through the centralized server.
     pub fn messageUser(self: *Client, rt: *zio.Runtime, username: []const u8, text: []const u8) !void {
         // construct message
@@ -430,6 +439,7 @@ pub const PeerConnection = struct {
 
     // oneshot channels for request-response
     user_info_channel: ?*zio.Channel(messages.UserInfoMessage) = null,
+    shared_file_list_channel: ?*zio.Channel(messages.SharedFileListMessage) = null,
 
     // mutex for channel access
     channels_mutex: std.Thread.Mutex = .{},
@@ -528,6 +538,37 @@ pub const PeerConnection = struct {
         return channel.receive(rt);
     }
 
+    // Gets the connected peer's shared file list.
+    pub fn getSharedFileList(self: *PeerConnection, rt: *zio.Runtime) !messages.SharedFileListMessage {
+        // wait for handshake
+        while (self.connection_state.load(.seq_cst) != .connected) {
+            try rt.sleep(.fromMilliseconds(1));
+        }
+
+        // create oneshot channel for request-response
+        var one: [1]messages.SharedFileListMessage = undefined;
+        var channel = zio.Channel(messages.SharedFileListMessage).init(&one);
+        defer channel.close(.graceful);
+
+        // register
+        self.channels_mutex.lock();
+        self.shared_file_list_channel = &channel;
+        self.channels_mutex.unlock();
+
+        // unregister on exit
+        defer {
+            self.channels_mutex.lock();
+            self.shared_file_list_channel = null;
+            self.channels_mutex.unlock();
+        }
+
+        // request user info
+        try self.sendPeerMessage(rt, .{ .getSharedFileList = .{} });
+
+        // block until we receive a response
+        return channel.receive(rt);
+    }
+
     // Peer message handler.
     fn readResponse(self: *PeerConnection, reader: *zio.net.Stream.Reader) !messages.PeerMessage {
         // TODO: handle error when socket is closed
@@ -578,15 +619,23 @@ pub const PeerConnection = struct {
                 .getSharedFileList => {
                     std.log.debug("\t{s} requests our shared files", .{self.username});
                     const msg = messages.SharedFileListMessage{
-                        .data = "",
+                        .directories = &[0]messages.SharedDirectory{},
                     };
                     self.sendPeerMessage(rt, .{ .sharedFileList = msg }) catch |err| {
                         std.log.err("Failed sending file list: {}", .{err});
                         continue;
                     };
                 },
-                .sharedFileList => {
-                    std.log.debug("\tReceived {s}'s file list (parsing unimplemented)", .{self.username});
+                .sharedFileList => |msg| {
+                    std.log.debug("\tReceived {s}'s file list", .{self.username});
+                    should_deinit = false;
+
+                    // send response in oneshot channel, if someone is waiting
+                    if (self.shared_file_list_channel) |channel| {
+                        channel.send(rt, msg) catch |err| {
+                            std.log.debug("Error sending shared file list response in oneshot channel: {}", .{err});
+                        };
+                    }
                 },
                 .getUserInfo => {
                     std.log.debug("\t{s} requests our user info", .{self.username});
