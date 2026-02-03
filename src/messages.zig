@@ -8,6 +8,7 @@ pub const Message = union(enum(u32)) {
     getPeerAddress: GetPeerAddressMessage = 3,
     connectToPeer: ConnectToPeerMessage = 18,
     messageUser: MessageUserMessage = 22,
+    fileSearch: FileSearchMessage = 26,
     messageAcked: MessageAckedMessage = 23,
     uploadSpeed: UploadSpeedMessage = 121,
 
@@ -98,6 +99,17 @@ pub const MessageUserMessage = struct {
     pub fn write(self: MessageUserMessage, writer: *std.Io.Writer) !void {
         try writeString(self.username, writer);
         try writeString(self.message, writer);
+    }
+};
+
+/// Represents server code 26, a message to represent a search query.
+pub const FileSearchMessage = struct {
+    token: u32,
+    query: []const u8,
+
+    pub fn write(self: FileSearchMessage, writer: *std.Io.Writer) !void {
+        try writer.writeInt(u32, self.token, .little);
+        try writeString(self.query, writer);
     }
 };
 
@@ -419,6 +431,7 @@ pub const ExcludedSearchPhrasesResponse = struct {
 pub const PeerMessage = union(enum(u32)) {
     getSharedFileList: EmptyMessage = 4,
     sharedFileList: SharedFileListMessage = 5,
+    fileSearchResponse: FileSearchResponseMessage = 9,
     getUserInfo: EmptyMessage = 15,
     userInfo: UserInfoMessage = 16,
 
@@ -451,7 +464,7 @@ pub const PeerMessage = union(enum(u32)) {
     // Writes a message.
     pub fn write(self: PeerMessage, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
         switch (self) {
-            .sharedFileList => |msg| try msg.write(allocator, writer), // zlib compressed, size unknown
+            inline .sharedFileList, .fileSearchResponse => |msg| try msg.write(allocator, writer), // zlib compressed, size unknown
             inline else => |msg| {
                 try writer.writeInt(u32, try self.size() + 4, .little);
                 try writer.writeInt(u32, self.code(), .little);
@@ -470,10 +483,12 @@ pub const SharedFileListMessage = struct {
         for (self.directories) |*dir| {
             dir.deinit(allocator);
         }
+        allocator.free(self.directories);
+
         for (self.private_directories) |*dir| {
             dir.deinit(allocator);
         }
-        allocator.free(self.directories);
+        allocator.free(self.private_directories);
     }
 
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !SharedFileListMessage {
@@ -484,7 +499,6 @@ pub const SharedFileListMessage = struct {
         const dir_count = try decompressor.reader.takeInt(u32, .little);
         const directories = try allocator.alloc(SharedDirectory, dir_count);
         errdefer allocator.free(directories);
-
         for (directories) |*dir| {
             dir.* = try SharedDirectory.parse(allocator, &decompressor.reader);
             errdefer dir.deinit(allocator);
@@ -496,7 +510,6 @@ pub const SharedFileListMessage = struct {
         const priv_dir_count = try decompressor.reader.takeInt(u32, .little);
         const private_directories = try allocator.alloc(SharedDirectory, priv_dir_count);
         errdefer allocator.free(private_directories);
-
         for (private_directories) |*dir| {
             dir.* = try SharedDirectory.parse(allocator, &decompressor.reader);
             errdefer dir.deinit(allocator);
@@ -537,6 +550,114 @@ pub const SharedFileListMessage = struct {
         // write header, size is now known
         try writer.writeInt(u32, @intCast(compressed.len + 4), .little);
         try writer.writeInt(u32, 5, .little);
+
+        // write body
+        try writer.writeAll(compressed);
+    }
+};
+
+/// Represents peer code 9, a message containing a response to a file search.
+pub const FileSearchResponseMessage = struct {
+    username: []const u8,
+    token: u32,
+    files: []SharedFile,
+    slots_free: bool,
+    avg_speed: u32,
+    queue_len: u32,
+    private_files: []SharedFile,
+
+    pub fn deinit(self: *FileSearchResponseMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.username);
+
+        for (self.files) |*file| {
+            file.deinit(allocator);
+        }
+        allocator.free(self.files);
+
+        for (self.private_files) |*file| {
+            file.deinit(allocator);
+        }
+        allocator.free(self.private_files);
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !FileSearchResponseMessage {
+        // message is zlib compressed
+        var buf: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompressor = std.compress.flate.Decompress.init(reader, .zlib, &buf);
+
+        const username = try readString(allocator, &decompressor.reader);
+        const token = try decompressor.reader.takeInt(u32, .little);
+
+        const file_count = try decompressor.reader.takeInt(u32, .little);
+        const files = try allocator.alloc(SharedFile, file_count);
+        errdefer allocator.free(files);
+        for (files) |*file| {
+            file.* = try SharedFile.parse(allocator, &decompressor.reader);
+            errdefer file.deinit(allocator);
+        }
+
+        const slots_free = (try decompressor.reader.takeByte() == 1);
+        const avg_speed = try decompressor.reader.takeInt(u32, .little);
+        const queue_len = try decompressor.reader.takeInt(u32, .little);
+
+        // official clients read u32 0
+        _ = try decompressor.reader.takeByte();
+
+        const priv_file_count = try decompressor.reader.takeInt(u32, .little);
+        const private_files = try allocator.alloc(SharedFile, priv_file_count);
+        errdefer allocator.free(private_files);
+        for (private_files) |*file| {
+            file.* = try SharedFile.parse(allocator, &decompressor.reader);
+            errdefer file.deinit(allocator);
+        }
+
+        return FileSearchResponseMessage{
+            .username = username,
+            .token = token,
+            .files = files,
+            .slots_free = slots_free,
+            .avg_speed = avg_speed,
+            .queue_len = queue_len,
+            .private_files = private_files,
+        };
+    }
+
+    pub fn write(self: FileSearchResponseMessage, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
+        // body is zlib compressed
+        var intermediate_writer = try std.Io.Writer.Allocating.initCapacity(allocator, 9); // allocating writer, but compressor asserts that output buf > 8.
+        defer intermediate_writer.deinit();
+
+        var buf: [std.compress.flate.max_window_len]u8 = undefined;
+        var compressor = try std.compress.flate.Compress.init(&intermediate_writer.writer, &buf, .zlib, .level_6);
+
+        try writeString(self.username, &compressor.writer);
+        try compressor.writer.writeInt(u32, self.token, .little);
+
+        try compressor.writer.writeInt(u32, @intCast(self.files.len), .little);
+        for (self.files) |*file| {
+            try file.write(&compressor.writer);
+        }
+
+        try writer.writeByte(@intFromBool(self.slots_free));
+        try compressor.writer.writeInt(u32, self.avg_speed, .little);
+        try compressor.writer.writeInt(u32, self.queue_len, .little);
+
+        // official clients write u32 0
+        try compressor.writer.writeInt(u32, 0, .little);
+
+        try compressor.writer.writeInt(u32, @intCast(self.private_files.len), .little);
+        for (self.private_files) |*file| {
+            try file.write(&compressor.writer);
+        }
+
+        try compressor.writer.flush();
+
+        const compressed = try intermediate_writer.toOwnedSlice();
+        defer allocator.free(compressed);
+
+        // write header, size is now known
+        try writer.writeInt(u32, @intCast(compressed.len + 4), .little);
+        try writer.writeInt(u32, 9, .little);
 
         // write body
         try writer.writeAll(compressed);

@@ -10,6 +10,7 @@ const LISTEN_PORT: u16 = 22340;
 const Command = enum {
     filelist, // retrieves file list for a target username (ex. filelist <username>)
     msg, // sends a message to a target user (ex. msg <username> <content>)
+    search, // searches network for files matching a target query (ex. search <query>)
     userinfo, // retrieves user info for a target username (ex. userinfo <username>)
     exit, // exits the application
 };
@@ -104,6 +105,17 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                             continue;
                         };
                         print(rt, "Message sent.\n", .{});
+                    },
+                    Command.search => {
+                        const query = it.rest();
+                        if (query.len == 0) {
+                            print(rt, "[error] syntax: search <query>\n", .{});
+                        }
+
+                        client.fileSearch(rt, query) catch |err| {
+                            std.log.err("Could not search network for file: {}", .{err});
+                            continue;
+                        };
                     },
                     Command.userinfo => {
                         const user = it.next() orelse {

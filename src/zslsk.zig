@@ -101,8 +101,7 @@ pub const Client = struct {
         self.peer_group = &peer_group;
         defer self.peer_group.?.cancel(rt);
 
-        _ = listen_port;
-        //try self.peer_group.?.spawn(rt, p2pListenerTask, .{ self, rt, listen_port }); // p2p listener
+        try self.peer_group.?.spawn(rt, p2pListenerTask, .{ self, rt, listen_port }); // p2p listener
 
         // begin read loop
         self.readLoop(rt, &reader);
@@ -126,6 +125,29 @@ pub const Client = struct {
 
         // get user info
         return try conn.getSharedFileList(rt);
+    }
+
+    /// Searches network for files matching a specified query.
+    pub fn fileSearch(self: *Client, rt: *zio.Runtime, query: []const u8) !void {
+        // zig new std.Io to access std.Io.random
+        var threaded = std.Io.Threaded.init(self.allocator, .{
+            .environ = .empty,
+        }); // FIX: this is improper use of Zig's new std.Io. beyond that, it's also a mess and I hate it.
+        defer threaded.deinit();
+        const io = threaded.ioBasic();
+
+        // generate a random token to track the search
+        var token: u32 = undefined;
+        io.random(std.mem.asBytes(&token));
+
+        // execute search on centralized server
+        const file_search_msg = messages.FileSearchMessage{
+            .token = token,
+            .query = query,
+        };
+        try self.sendMessage(rt, .{ .fileSearch = file_search_msg });
+
+        return error.Unimplemented;
     }
 
     /// Sends a direct message to a user through the centralized server.
@@ -169,8 +191,14 @@ pub const Client = struct {
     // P2P listener.
     fn p2pListenerTask(self: *Client, rt: *zio.Runtime, listen_port: u16) void {
         // listen for p2p connections
-        const listen_addr = try zio.net.IpAddress.parseIp4("0.0.0.0", listen_port);
-        self.p2p_server = try listen_addr.listen(rt, .{});
+        const listen_addr = zio.net.IpAddress.parseIp4("0.0.0.0", listen_port) catch |err| {
+            std.log.err("P2P listener failed to parse address: {}", .{err});
+            return;
+        };
+        self.p2p_server = listen_addr.listen(rt, .{}) catch |err| {
+            std.log.err("P2P listener failed to listen: {}", .{err});
+            return;
+        };
         std.log.debug("Listening for P2P connections on port {d}", .{
             listen_port,
         });
@@ -181,7 +209,10 @@ pub const Client = struct {
         };
 
         std.log.debug("Sending message to advertise P2P port...", .{});
-        try self.sendMessage(rt, .{ .setWaitPort = set_wait_port_msg });
+        self.sendMessage(rt, .{ .setWaitPort = set_wait_port_msg }) catch |err| {
+            std.log.err("P2P listener failed to advertise listen port: {}", .{err});
+            return;
+        };
         std.log.debug("Advertised P2P port successfully.", .{});
 
         while (self.connection_state.load(.seq_cst) == .connected) {
@@ -192,6 +223,7 @@ pub const Client = struct {
             errdefer stream.close(rt);
 
             std.log.debug("Incoming P2P connection from {f}", .{stream.socket.address});
+            stream.close(rt);
             //try peer_group.spawn(rt, handleIncomingPeer, .{ self, rt, stream });
         }
     }
@@ -582,6 +614,7 @@ pub const PeerConnection = struct {
         return switch (message_code) {
             4 => .{ .getSharedFileList = try messages.EmptyMessage.parse(self.allocator, &reader.interface) },
             5 => .{ .sharedFileList = try messages.SharedFileListMessage.parse(self.allocator, &reader.interface) },
+            9 => .{ .fileSearchResponse = try messages.FileSearchResponseMessage.parse(self.allocator, &reader.interface) },
             15 => .{ .getUserInfo = try messages.EmptyMessage.parse(self.allocator, &reader.interface) },
             16 => .{ .userInfo = try messages.UserInfoMessage.parse(self.allocator, &reader.interface, start_seek, payload_len) },
             else => {
@@ -642,10 +675,10 @@ pub const PeerConnection = struct {
 
                     // send shared file list to peer
                     self.sendPeerMessage(rt, .{ .sharedFileList = msg }) catch |err| {
-                        std.log.err("Failed sending file list: {}", .{err});
+                        std.log.err("\tFailed sending file list: {}", .{err});
                         continue;
                     };
-                    std.log.debug("Sent {s} our file list", .{self.username});
+                    std.log.debug("\tSent {s} our file list", .{self.username});
                 },
                 .sharedFileList => |msg| {
                     std.log.debug("\tReceived {s}'s file list", .{self.username});
@@ -654,8 +687,19 @@ pub const PeerConnection = struct {
                     // send response in oneshot channel, if someone is waiting
                     if (self.shared_file_list_channel) |channel| {
                         channel.send(rt, msg) catch |err| {
-                            std.log.debug("Error sending shared file list response in oneshot channel: {}", .{err});
+                            std.log.err("\tError sending shared file list response in oneshot channel: {}", .{err});
+                            should_deinit = true;
+                            continue;
                         };
+                    }
+                },
+                .fileSearchResponse => |msg| {
+                    std.log.debug("\tReceived {s}'s file search response for our query {d}", .{ self.username, msg.token });
+                    should_deinit = true; // TODO: flip to false when proper channel for streaming results back to caller is implemented
+
+                    // print some info
+                    for (msg.files) |*file| {
+                        std.log.debug("\t{s} ({d} bytes)", .{ file.name, file.size });
                     }
                 },
                 .getUserInfo => {
@@ -671,10 +715,10 @@ pub const PeerConnection = struct {
                     };
 
                     self.sendPeerMessage(rt, .{ .userInfo = msg }) catch |err| {
-                        std.log.err("Failed sending user info: {}", .{err});
+                        std.log.err("\tFailed sending user info: {}", .{err});
                         continue;
                     };
-                    std.log.debug("Sent {s} our user info", .{self.username});
+                    std.log.debug("\tSent {s} our user info", .{self.username});
                 },
                 .userInfo => |msg| {
                     std.log.debug("\tReceived {s}'s user info", .{self.username});
@@ -683,7 +727,9 @@ pub const PeerConnection = struct {
                     // send response in oneshot channel, if someone is waiting
                     if (self.user_info_channel) |channel| {
                         channel.send(rt, msg) catch |err| {
-                            std.log.debug("Error sending user info response in oneshot channel: {}", .{err});
+                            std.log.err("\tError sending user info response in oneshot channel: {}", .{err});
+                            should_deinit = true;
+                            continue;
                         };
                     }
                 },
