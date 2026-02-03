@@ -618,13 +618,34 @@ pub const PeerConnection = struct {
             switch (message) {
                 .getSharedFileList => {
                     std.log.debug("\t{s} requests our shared files", .{self.username});
-                    const msg = messages.SharedFileListMessage{
-                        .directories = &[0]messages.SharedDirectory{},
+
+                    const files = self.allocator.alloc(messages.SharedFile, 1) catch continue;
+
+                    files[0] = .{
+                        .code = 1,
+                        .name = "hello_world.zig",
+                        .size = 420,
+                        .extension = "zig",
+                        .attributes = &[_]messages.FileAttributes{},
                     };
+
+                    const dirs = self.allocator.alloc(messages.SharedDirectory, 1) catch continue;
+                    dirs[0] = .{
+                        .name = "zslsk\\files",
+                        .files = files,
+                    };
+
+                    const msg = messages.SharedFileListMessage{
+                        .directories = dirs,
+                        .private_directories = &[_]messages.SharedDirectory{},
+                    };
+
+                    // send shared file list to peer
                     self.sendPeerMessage(rt, .{ .sharedFileList = msg }) catch |err| {
                         std.log.err("Failed sending file list: {}", .{err});
                         continue;
                     };
+                    std.log.debug("Sent {s} our file list", .{self.username});
                 },
                 .sharedFileList => |msg| {
                     std.log.debug("\tReceived {s}'s file list", .{self.username});
@@ -639,7 +660,7 @@ pub const PeerConnection = struct {
                 },
                 .getUserInfo => {
                     std.log.debug("\t{s} requests our user info", .{self.username});
-                    // TODO: implement some form of user profile properties to source this data from
+
                     const msg = messages.UserInfoMessage{
                         .description = "hello from zslsk",
                         .picture = null,
@@ -648,6 +669,7 @@ pub const PeerConnection = struct {
                         .total_upload = 420,
                         .upload_permitted = .everyone,
                     };
+
                     self.sendPeerMessage(rt, .{ .userInfo = msg }) catch |err| {
                         std.log.err("Failed sending user info: {}", .{err});
                         continue;
@@ -689,7 +711,7 @@ pub const PeerConnection = struct {
         var write_buf: [4096]u8 = undefined;
         var writer = self.socket.writer(rt, &write_buf);
         const writer_interface = &writer.interface;
-        try msg.write(writer_interface);
+        try msg.write(self.allocator, writer_interface);
         try writer_interface.flush();
     }
 };

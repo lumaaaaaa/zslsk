@@ -449,12 +449,14 @@ pub const PeerMessage = union(enum(u32)) {
     }
 
     // Writes a message.
-    pub fn write(self: PeerMessage, writer: *std.Io.Writer) !void {
-        try writer.writeInt(u32, try self.size() + 4, .little); // message length as u32, add 4 for message code
-        try writer.writeInt(u32, self.code(), .little); // message code as u32
-
+    pub fn write(self: PeerMessage, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
         switch (self) {
-            inline else => |msg| try msg.write(writer), // call underlying write function in relevant message
+            .sharedFileList => |msg| try msg.write(allocator, writer), // zlib compressed, size unknown
+            inline else => |msg| {
+                try writer.writeInt(u32, try self.size() + 4, .little);
+                try writer.writeInt(u32, self.code(), .little);
+                try msg.write(writer);
+            },
         }
     }
 };
@@ -462,9 +464,13 @@ pub const PeerMessage = union(enum(u32)) {
 /// Represents peer code 5, a message containing files shared by a client.
 pub const SharedFileListMessage = struct {
     directories: []SharedDirectory,
+    private_directories: []SharedDirectory,
 
     pub fn deinit(self: *SharedFileListMessage, allocator: std.mem.Allocator) void {
         for (self.directories) |*dir| {
+            dir.deinit(allocator);
+        }
+        for (self.private_directories) |*dir| {
             dir.deinit(allocator);
         }
         allocator.free(self.directories);
@@ -484,16 +490,56 @@ pub const SharedFileListMessage = struct {
             errdefer dir.deinit(allocator);
         }
 
+        // official clients read u32 0
+        _ = try decompressor.reader.takeByte();
+
+        const priv_dir_count = try decompressor.reader.takeInt(u32, .little);
+        const private_directories = try allocator.alloc(SharedDirectory, priv_dir_count);
+        errdefer allocator.free(private_directories);
+
+        for (private_directories) |*dir| {
+            dir.* = try SharedDirectory.parse(allocator, &decompressor.reader);
+            errdefer dir.deinit(allocator);
+        }
+
         return SharedFileListMessage{
             .directories = directories,
+            .private_directories = private_directories,
         };
     }
 
-    pub fn write(self: SharedFileListMessage, writer: *std.Io.Writer) !void {
-        // blocked by zlib compress, wait for Zig 0.16.0
-        _ = self;
-        _ = writer;
-        return error.Unimplemented;
+    pub fn write(self: SharedFileListMessage, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
+        // body is zlib compressed
+        var intermediate_writer = try std.Io.Writer.Allocating.initCapacity(allocator, 9); // allocating writer, but compressor asserts that output buf > 8.
+        defer intermediate_writer.deinit();
+
+        var buf: [std.compress.flate.max_window_len]u8 = undefined;
+        var compressor = try std.compress.flate.Compress.init(&intermediate_writer.writer, &buf, .zlib, .level_6);
+
+        try compressor.writer.writeInt(u32, @intCast(self.directories.len), .little);
+        for (self.directories) |*dir| {
+            try dir.write(&compressor.writer);
+        }
+
+        // official clients write u32 0
+        try compressor.writer.writeInt(u32, 0, .little);
+
+        try compressor.writer.writeInt(u32, @intCast(self.private_directories.len), .little);
+        for (self.private_directories) |*dir| {
+            try dir.write(&compressor.writer);
+        }
+
+        try compressor.writer.flush();
+
+        const compressed = try intermediate_writer.toOwnedSlice();
+        defer allocator.free(compressed);
+
+        // write header, size is now known
+        try writer.writeInt(u32, @intCast(compressed.len + 4), .little);
+        try writer.writeInt(u32, 5, .little);
+
+        // write body
+        try writer.writeAll(compressed);
     }
 };
 
@@ -525,6 +571,14 @@ pub const SharedDirectory = struct {
             .name = name,
             .files = files,
         };
+    }
+
+    pub fn write(self: SharedDirectory, writer: *std.Io.Writer) !void {
+        try writeString(self.name, writer);
+        try writer.writeInt(u32, @intCast(self.files.len), .little);
+        for (self.files) |*file| {
+            try file.write(writer);
+        }
     }
 };
 
@@ -563,6 +617,19 @@ pub const SharedFile = struct {
             .extension = extension,
             .attributes = attributes,
         };
+    }
+
+    pub fn write(self: SharedFile, writer: *std.Io.Writer) !void {
+        try writer.writeByte(self.code);
+        try writeString(self.name, writer);
+        try writer.writeInt(u64, self.size, .little);
+        try writeString(self.extension, writer);
+        try writer.writeInt(u32, @intCast(self.attributes.len), .little);
+
+        for (self.attributes) |*attribute| {
+            try writer.writeInt(u32, attribute.code, .little);
+            try writer.writeInt(u32, attribute.value, .little);
+        }
     }
 };
 
