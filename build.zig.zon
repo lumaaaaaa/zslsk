@@ -2,7 +2,7 @@
     .name = .zslsk,
     .version = "0.0.0",
     .fingerprint = 0x9375a0a014c4c731,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0-dev.2459+37d14a4f3",
     .dependencies = .{
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio?ref=zig-0.16#6c61ec7a439a9d3f79a6cb629d39fe08b63c2fd6",
