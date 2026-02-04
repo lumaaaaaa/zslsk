@@ -41,7 +41,7 @@ pub fn main() !void {
     var task = try rt.spawn(app, .{ rt, &client, allocator, username, password });
     try task.join(rt);
 
-    print(rt, "[info] shutting down...", .{});
+    print(rt, "[info] shutting down...\n", .{});
 }
 
 fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, username: []const u8, password: []const u8) !void {
@@ -117,8 +117,7 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                             continue;
                         };
 
-                        var task = try rt.spawn(printSearchResults, .{ rt, allocator, channel });
-                        task.detach(rt);
+                        _ = try client_group.spawn(rt, printSearchResults, .{ rt, allocator, channel });
                     },
                     Command.userinfo => {
                         const user = it.next() orelse {
@@ -134,7 +133,10 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
 
                         print(rt, "{s}: {s}\n", .{ user, user_info.description });
                     },
-                    Command.exit => break,
+                    Command.exit => {
+                        client.disconnect(rt);
+                        break;
+                    },
                 }
             } else {
                 print(rt, "[error] unknown command.\n", .{});
@@ -144,8 +146,8 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
 }
 
 /// Prints search results from a channel as they come in.
-fn printSearchResults(rt: *zio.Runtime, allocator: std.mem.Allocator, channel: *zio.Channel(zslsk.messages.FileSearchResponseMessage)) void {
-    while (channel.receive(rt)) |msg| {
+fn printSearchResults(rt: *zio.Runtime, allocator: std.mem.Allocator, search_channel: zslsk.SearchChannel) void {
+    while (search_channel.channel.receive(rt)) |msg| {
         defer msg.deinit(allocator);
         print(rt, "== user {s} | count {d} | speed {d} ==\n", .{ msg.username, msg.files.len, msg.avg_speed });
         for (msg.files) |file| {

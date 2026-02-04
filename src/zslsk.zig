@@ -10,6 +10,12 @@ pub const ConnectionState = enum(u8) {
     failed,
 };
 
+pub const SearchChannel = struct {
+    token: u32,
+    channel: *zio.Channel(messages.FileSearchResponseMessage),
+    buffer: []messages.FileSearchResponseMessage,
+};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     connection_state: std.atomic.Value(ConnectionState) = std.atomic.Value(ConnectionState).init(.disconnected), // connection state
@@ -21,14 +27,14 @@ pub const Client = struct {
     connected_peer_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     // group for peer task execution
-    peer_group: ?*zio.Group,
+    peer_group: zio.Group = .init,
 
     // oneshot channels for request-response, keyed by username for concurrency
     get_peer_address_channels: std.StringHashMap(*zio.Channel(messages.GetPeerAddressResponse)),
     waiters_mutex: std.Thread.Mutex = .{},
 
     // channels for streaming request-response
-    search_result_channels: std.AutoHashMap(u32, *zio.Channel(messages.FileSearchResponseMessage)),
+    search_result_channels: std.AutoHashMap(u32, SearchChannel),
     search_mutex: std.Thread.Mutex = .{},
 
     /// Exported Library Functions ///
@@ -39,24 +45,46 @@ pub const Client = struct {
             .p2p_server = null,
             .peers = .init(allocator),
             .own_username = null,
-            .peer_group = null,
             .get_peer_address_channels = .init(allocator),
             .search_result_channels = .init(allocator),
         };
     }
 
     pub fn deinit(self: *Client) void {
-        // disconnect
-        self.connection_state.store(.disconnected, .seq_cst);
         if (self.own_username) |username| self.allocator.free(username);
         self.get_peer_address_channels.deinit();
+
+        var search_iter = self.search_result_channels.iterator();
+        while (search_iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.buffer);
+            self.allocator.destroy(entry.value_ptr.channel);
+        }
         self.search_result_channels.deinit();
+
+        self.peers.deinit();
+    }
+
+    pub fn disconnect(self: *Client, rt: *zio.Runtime) void {
+        // disconnect (this should cascade and shut down loops)
+        self.connection_state.store(.disconnected, .seq_cst);
+
+        // shut down our connections
+        if (self.socket) |s| s.close(rt);
+        if (self.p2p_server) |s| s.close(rt);
+
+        // close searches
+        self.search_mutex.lock();
+        var search_iter = self.search_result_channels.iterator();
+        while (search_iter.next()) |channel| {
+            channel.value_ptr.*.channel.close(.graceful);
+        }
+        self.search_mutex.unlock();
     }
 
     /// Connects and authenticates with a Soulseek server. Begins the async runtime.
     pub fn run(self: *Client, rt: *zio.Runtime, hostname: []const u8, port: u16, username: []const u8, password: []const u8, listen_port: u16) !void {
         // store own username
-        self.own_username = username;
+        self.own_username = try self.allocator.dupe(u8, username);
 
         // connect to server
         std.log.debug("Establishing TCP connection to host {s}:{d}...", .{ hostname, port });
@@ -105,16 +133,24 @@ pub const Client = struct {
         self.connection_state.store(.connected, .seq_cst);
 
         // dispatch concurrent tasks
-        var peer_group: zio.Group = .init;
-        self.peer_group = &peer_group;
-        defer self.peer_group.?.cancel(rt);
-
-        try self.peer_group.?.spawn(rt, p2pListenerTask, .{ self, rt, listen_port }); // p2p listener
+        try self.peer_group.spawn(rt, p2pListenerTask, .{ self, rt, listen_port }); // p2p listener
 
         // begin read loop
         self.readLoop(rt, &reader);
 
-        self.peer_group.?.wait(rt) catch {};
+        // shutdown peers
+        self.peers_mutex.lock();
+        var iter = self.peers.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.*.connection_state.store(.disconnected, .seq_cst);
+            if (entry.value_ptr.*.socket) |s| {
+                s.close(rt);
+                entry.value_ptr.*.socket = null;
+            }
+        }
+        self.peers_mutex.unlock();
+
+        self.peer_group.cancel(rt);
     }
 
     /// Gets user info of the user with the specified username.
@@ -136,7 +172,7 @@ pub const Client = struct {
     }
 
     /// Searches network for files matching a specified query.
-    pub fn fileSearch(self: *Client, rt: *zio.Runtime, query: []const u8) !*zio.Channel(messages.FileSearchResponseMessage) {
+    pub fn fileSearch(self: *Client, rt: *zio.Runtime, query: []const u8) !SearchChannel {
         // zig new std.Io to access std.Io.random
         var threaded = std.Io.Threaded.init(self.allocator, .{
             .environ = .empty,
@@ -150,12 +186,21 @@ pub const Client = struct {
 
         // create a channel for the search results (backed by 256 FileSearchResponseMessages)
         const buf = try self.allocator.alloc(messages.FileSearchResponseMessage, 256);
+        errdefer self.allocator.free(buf);
         const channel = try self.allocator.create(zio.Channel(messages.FileSearchResponseMessage));
+        errdefer self.allocator.destroy(channel);
         channel.* = zio.Channel(messages.FileSearchResponseMessage).init(buf);
+
+        // wrap channel as SearchChannel
+        const search_channel = SearchChannel{
+            .token = token,
+            .channel = channel,
+            .buffer = buf,
+        };
 
         // register channel in search map
         self.search_mutex.lock();
-        try self.search_result_channels.put(token, channel);
+        try self.search_result_channels.put(token, search_channel);
         self.search_mutex.unlock();
 
         // execute search on centralized server
@@ -165,7 +210,7 @@ pub const Client = struct {
         };
         try self.sendMessage(rt, .{ .fileSearch = file_search_msg });
 
-        return channel;
+        return search_channel;
     }
 
     /// Sends a direct message to a user through the centralized server.
@@ -261,7 +306,7 @@ pub const Client = struct {
             // handle async message types
             std.log.debug("== Received message: {s} (code: {d}) ==", .{ @tagName(message), message.code() });
             switch (message) {
-                .login => continue, // do nothing, we handle logins just once, synchronously on connect
+                .login => {}, // do nothing, we handle logins just once, synchronously on connect
                 .getPeerAddress => |resp| {
                     std.log.debug("\tReceived {s}'s address", .{resp.username});
                     should_deinit = false;
@@ -286,11 +331,9 @@ pub const Client = struct {
                     });
                     should_deinit = false;
 
-                    if (self.peer_group) |group| {
-                        group.spawn(rt, handleConnectToPeer, .{ self, rt, resp }) catch |err| {
-                            std.log.err("Could not spawn thread to handle ConnectToPeer message: {}", .{err});
-                        };
-                    }
+                    self.peer_group.spawn(rt, handleConnectToPeer, .{ self, rt, resp }) catch |err| {
+                        std.log.err("Could not spawn thread to handle ConnectToPeer message: {}", .{err});
+                    };
                 },
                 .messageUser => |resp| {
                     std.log.info("\tPrivate chat received | {s}: {s}", .{ resp.username, resp.message });
@@ -307,12 +350,12 @@ pub const Client = struct {
 
                     std.log.debug("Acknowledged private chat receipt", .{});
                 },
-                .roomList => |resp| std.log.debug("\tRoom counts: {d} total, {d} owned private, {d} unowned private, {d} operated private", .{ resp.rooms.capacity, resp.owned_private_rooms.capacity, resp.unowned_private_rooms.capacity, resp.operated_private_rooms.capacity }),
-                .privilegedUsers => |resp| std.log.debug("\tPrivileged user count: {d}", .{resp.users.capacity}), // just print for now
+                .roomList => |resp| std.log.debug("\tRoom counts: {d} total, {d} owned private, {d} unowned private, {d} operated private", .{ resp.rooms.len, resp.owned_private_rooms.len, resp.unowned_private_rooms.len, resp.operated_private_rooms.len }),
+                .privilegedUsers => |resp| std.log.debug("\tPrivileged user count: {d}", .{resp.users.len}), // just print for now
                 .parentMinSpeed => |resp| std.log.debug("\tMinimum upload speed to become parent: {d}", .{resp.speed}), // just print for now
                 .parentSpeedRatio => |resp| std.log.debug("\tParent speed ratio: {d}", .{resp.ratio}), // just print for now
                 .wishlistSearch => |resp| std.log.debug("\tWishlist search interval: {d} seconds", .{resp.interval}), // just print for now
-                .excludedSearchPhrases => |resp| std.log.debug("\tExcluded search phrase count: {d}", .{resp.phrases.capacity}), // TODO: store these phrases, search requests should exclude paths containing these strings
+                .excludedSearchPhrases => |resp| std.log.debug("\tExcluded search phrase count: {d}", .{resp.phrases.len}), // TODO: store these phrases, search requests should exclude paths containing these strings
             }
         }
     }
@@ -426,11 +469,7 @@ pub const Client = struct {
 
     // Spawns peer and begins running.
     fn spawnPeer(self: *Client, rt: *zio.Runtime, peer: *PeerConnection, we_initiated: bool) !void {
-        if (self.peer_group) |group| {
-            try group.spawn(rt, runPeer, .{ self, rt, peer, we_initiated });
-        } else {
-            return error.NotConnected;
-        }
+        try self.peer_group.spawn(rt, runPeer, .{ self, rt, peer, we_initiated });
     }
 
     // Runs the peer.
@@ -761,9 +800,9 @@ pub const PeerConnection = struct {
                     self.client.search_mutex.unlock();
 
                     // if channel exists, send response
-                    if (search_channel) |channel| {
+                    if (search_channel) |s| {
                         should_deinit = false; // responsibility of receiver to deinit the response
-                        channel.send(rt, msg) catch |err| {
+                        s.channel.send(rt, msg) catch |err| {
                             std.log.err("\tError sending file search response in channel: {}", .{err});
                             should_deinit = true;
                             continue;

@@ -283,16 +283,20 @@ pub const MessageUserResponse = struct {
 
 /// Represents a RoomList response.
 pub const RoomListResponse = struct {
-    rooms: std.ArrayList(types.Room),
-    owned_private_rooms: std.ArrayList(types.Room),
-    unowned_private_rooms: std.ArrayList(types.Room),
-    operated_private_rooms: std.ArrayList(types.Room),
+    rooms: []Room,
+    owned_private_rooms: []Room,
+    unowned_private_rooms: []Room,
+    operated_private_rooms: []Room,
 
     pub fn deinit(self: *RoomListResponse, allocator: std.mem.Allocator) void {
-        self.rooms.deinit(allocator);
-        self.owned_private_rooms.deinit(allocator);
-        self.unowned_private_rooms.deinit(allocator);
-        self.operated_private_rooms.deinit(allocator);
+        for (self.rooms) |*room| room.deinit(allocator);
+        allocator.free(self.rooms);
+        for (self.owned_private_rooms) |*room| room.deinit(allocator);
+        allocator.free(self.owned_private_rooms);
+        for (self.unowned_private_rooms) |*room| room.deinit(allocator);
+        allocator.free(self.unowned_private_rooms);
+        for (self.operated_private_rooms) |*room| room.deinit(allocator);
+        allocator.free(self.operated_private_rooms);
     }
 
     pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !RoomListResponse {
@@ -304,54 +308,72 @@ pub const RoomListResponse = struct {
         };
     }
 
-    /// Helper function to read Rooms to an ArrayList.
-    fn readRooms(reader: *std.Io.Reader, allocator: std.mem.Allocator, skip_user_count: bool) !std.ArrayList(types.Room) {
-        var room_count = try reader.takeInt(u32, .little);
-        var result = try std.ArrayList(types.Room).initCapacity(allocator, room_count);
-
-        // first, add rooms with names
-        for (0..room_count) |_| {
-            // add room with placeholder count
-            result.appendAssumeCapacity(types.Room{
-                .name = try readString(allocator, reader),
-                .user_count = 0, // will be set in second pass
-            });
+    /// Helper function to read Rooms to a slice.
+    fn readRooms(reader: *std.Io.Reader, allocator: std.mem.Allocator, skip_user_count: bool) ![]Room {
+        const room_count = try reader.takeInt(u32, .little);
+        const rooms = try allocator.alloc(Room, room_count);
+        var rooms_parsed: usize = 0;
+        errdefer {
+            for (rooms[0..rooms_parsed]) |*room| {
+                room.deinit(allocator);
+            }
+            allocator.free(rooms);
         }
 
-        // then, set user count if needed
+        // first pass, add room names
+        for (rooms) |*room| {
+            room.*.name = try readString(allocator, reader);
+            rooms_parsed += 1;
+        }
+
+        // second pass, set user count if needed
         if (!skip_user_count) {
-            room_count = try reader.takeInt(u32, .little); // read it again, server supplies it once more
-            for (result.items) |*room| {
-                // update the user count with the actual value on each
-                room.user_count = try reader.takeInt(u32, .little);
+            // room count again, discard
+            _ = try reader.takeInt(u32, .little);
+            for (rooms) |*room| {
+                room.*.user_count = try reader.takeInt(u32, .little);
             }
         }
 
-        return result;
+        return rooms;
+    }
+};
+
+/// Represents a Room on the Soulseek network.
+pub const Room = struct {
+    name: []const u8,
+    user_count: u32,
+
+    pub fn deinit(self: *Room, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
     }
 };
 
 /// Represents a PrivilegedUsers response.
 pub const PrivilegedUsersResponse = struct {
-    users: std.ArrayList([]u8),
+    users: [][]const u8,
 
     pub fn deinit(self: *PrivilegedUsersResponse, allocator: std.mem.Allocator) void {
-        self.users.deinit(allocator);
+        for (self.users) |user| allocator.free(user);
+        allocator.free(self.users);
     }
 
     pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !PrivilegedUsersResponse {
         const user_count = try reader.takeInt(u32, .little);
-
-        var response = PrivilegedUsersResponse{
-            .users = try std.ArrayList([]u8).initCapacity(allocator, user_count),
-        };
-
-        for (0..user_count) |_| {
-            const username = try readString(allocator, reader);
-            response.users.appendAssumeCapacity(username);
+        const users = try allocator.alloc([]const u8, user_count);
+        var users_parsed: usize = 0;
+        errdefer {
+            for (users[0..users_parsed]) |user| allocator.free(user);
+            allocator.free(users);
+        }
+        for (users) |*user| {
+            user.* = try readString(allocator, reader);
+            users_parsed += 1;
         }
 
-        return response;
+        return PrivilegedUsersResponse{
+            .users = users,
+        };
     }
 };
 
@@ -405,25 +427,29 @@ pub const WishlistSearchResponse = struct {
 
 /// Represents an ExcludedSearchPhrases response.
 pub const ExcludedSearchPhrasesResponse = struct {
-    phrases: std.ArrayList([]u8),
+    phrases: [][]const u8,
 
     pub fn deinit(self: *ExcludedSearchPhrasesResponse, allocator: std.mem.Allocator) void {
-        self.phrases.deinit(allocator);
+        for (self.phrases) |phrase| allocator.free(phrase);
+        allocator.free(self.phrases);
     }
 
     pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !ExcludedSearchPhrasesResponse {
         const phrase_count = try reader.takeInt(u32, .little);
-
-        var response = ExcludedSearchPhrasesResponse{
-            .phrases = try std.ArrayList([]u8).initCapacity(allocator, phrase_count),
-        };
-
-        for (0..phrase_count) |_| {
-            const phrase = try readString(allocator, reader);
-            response.phrases.appendAssumeCapacity(phrase);
+        const phrases = try allocator.alloc([]const u8, phrase_count);
+        var phrases_parsed: usize = 0;
+        errdefer {
+            for (phrases[0..phrases_parsed]) |phrase| allocator.free(phrase);
+            allocator.free(phrases);
+        }
+        for (phrases) |*phrase| {
+            phrase.* = try readString(allocator, reader);
+            phrases_parsed += 1;
         }
 
-        return response;
+        return ExcludedSearchPhrasesResponse{
+            .phrases = phrases,
+        };
     }
 };
 
