@@ -566,7 +566,7 @@ pub const FileSearchResponseMessage = struct {
     queue_len: u32,
     private_files: []SharedFile,
 
-    pub fn deinit(self: *FileSearchResponseMessage, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *const FileSearchResponseMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.username);
 
         for (self.files) |*file| {

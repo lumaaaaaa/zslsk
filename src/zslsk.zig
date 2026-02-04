@@ -1,5 +1,5 @@
 const std = @import("std");
-const messages = @import("messages.zig");
+pub const messages = @import("messages.zig");
 const types = @import("types.zig");
 const zio = @import("zio");
 
@@ -27,16 +27,21 @@ pub const Client = struct {
     get_peer_address_channels: std.StringHashMap(*zio.Channel(messages.GetPeerAddressResponse)),
     waiters_mutex: std.Thread.Mutex = .{},
 
+    // channels for streaming request-response
+    search_result_channels: std.AutoHashMap(u32, *zio.Channel(messages.FileSearchResponseMessage)),
+    search_mutex: std.Thread.Mutex = .{},
+
     /// Exported Library Functions ///
     pub fn init(allocator: std.mem.Allocator) !Client {
         return .{
             .allocator = allocator,
             .socket = null,
             .p2p_server = null,
-            .peers = std.StringHashMap(*PeerConnection).init(allocator),
+            .peers = .init(allocator),
             .own_username = null,
             .peer_group = null,
-            .get_peer_address_channels = std.StringHashMap(*zio.Channel(messages.GetPeerAddressResponse)).init(allocator),
+            .get_peer_address_channels = .init(allocator),
+            .search_result_channels = .init(allocator),
         };
     }
 
@@ -44,6 +49,8 @@ pub const Client = struct {
         // disconnect
         self.connection_state.store(.disconnected, .seq_cst);
         if (self.own_username) |username| self.allocator.free(username);
+        self.get_peer_address_channels.deinit();
+        self.search_result_channels.deinit();
     }
 
     /// Connects and authenticates with a Soulseek server. Begins the async runtime.
@@ -129,7 +136,7 @@ pub const Client = struct {
     }
 
     /// Searches network for files matching a specified query.
-    pub fn fileSearch(self: *Client, rt: *zio.Runtime, query: []const u8) !void {
+    pub fn fileSearch(self: *Client, rt: *zio.Runtime, query: []const u8) !*zio.Channel(messages.FileSearchResponseMessage) {
         // zig new std.Io to access std.Io.random
         var threaded = std.Io.Threaded.init(self.allocator, .{
             .environ = .empty,
@@ -141,6 +148,16 @@ pub const Client = struct {
         var token: u32 = undefined;
         io.random(std.mem.asBytes(&token));
 
+        // create a channel for the search results (backed by 256 FileSearchResponseMessages)
+        const buf = try self.allocator.alloc(messages.FileSearchResponseMessage, 256);
+        const channel = try self.allocator.create(zio.Channel(messages.FileSearchResponseMessage));
+        channel.* = zio.Channel(messages.FileSearchResponseMessage).init(buf);
+
+        // register channel in search map
+        self.search_mutex.lock();
+        try self.search_result_channels.put(token, channel);
+        self.search_mutex.unlock();
+
         // execute search on centralized server
         const file_search_msg = messages.FileSearchMessage{
             .token = token,
@@ -148,7 +165,7 @@ pub const Client = struct {
         };
         try self.sendMessage(rt, .{ .fileSearch = file_search_msg });
 
-        return error.Unimplemented;
+        return channel;
     }
 
     /// Sends a direct message to a user through the centralized server.
@@ -322,7 +339,7 @@ pub const Client = struct {
                 }
 
                 // new peer
-                const peer = PeerConnection.init(self.allocator, msg.username, self.own_username.?, msg.token, conn_type) catch |err| {
+                const peer = PeerConnection.init(self.allocator, self, msg.username, self.own_username.?, msg.token, conn_type) catch |err| {
                     std.log.err("Error initializing peer: {}", .{err});
                     _ = self.peers.remove(msg.username);
                     self.peers_mutex.unlock();
@@ -370,7 +387,7 @@ pub const Client = struct {
         }
 
         // new peer
-        const peer = PeerConnection.init(self.allocator, username, self.own_username.?, 0, .P) catch |err| {
+        const peer = PeerConnection.init(self.allocator, self, username, self.own_username.?, 0, .P) catch |err| {
             _ = self.peers.remove(username);
             self.peers_mutex.unlock();
             return err;
@@ -418,7 +435,7 @@ pub const Client = struct {
 
     // Runs the peer.
     fn runPeer(self: *Client, rt: *zio.Runtime, peer: *PeerConnection, we_initiated: bool) void {
-        peer.run(rt, self, we_initiated);
+        peer.run(rt, we_initiated);
 
         // cleanup
         self.peers_mutex.lock();
@@ -479,6 +496,7 @@ pub const Client = struct {
 
 pub const PeerConnection = struct {
     allocator: std.mem.Allocator,
+    client: *Client,
     username: []const u8,
     own_username: []const u8,
     token: u32,
@@ -495,10 +513,11 @@ pub const PeerConnection = struct {
     // connection state
     connection_state: std.atomic.Value(ConnectionState) = std.atomic.Value(ConnectionState).init(.disconnected),
 
-    pub fn init(allocator: std.mem.Allocator, username: []const u8, own_username: []const u8, token: u32, connection_type: types.ConnectionType) !*PeerConnection {
+    pub fn init(allocator: std.mem.Allocator, client: *Client, username: []const u8, own_username: []const u8, token: u32, connection_type: types.ConnectionType) !*PeerConnection {
         const pc = try allocator.create(PeerConnection);
         pc.* = .{
             .allocator = allocator,
+            .client = client,
             .socket = null,
             .username = try allocator.dupe(u8, username),
             .own_username = try allocator.dupe(u8, own_username),
@@ -537,7 +556,7 @@ pub const PeerConnection = struct {
     }
 
     // Self-contained peer connection logic.
-    pub fn run(self: *PeerConnection, rt: *zio.Runtime, client: *Client, we_initiated: bool) void {
+    pub fn run(self: *PeerConnection, rt: *zio.Runtime, we_initiated: bool) void {
         // reader for socket
         var read_buf: [4096]u8 = undefined;
         var reader = self.socket.?.reader(rt, &read_buf);
@@ -570,8 +589,8 @@ pub const PeerConnection = struct {
         self.connection_state.store(.connected, .seq_cst);
 
         // update metrics in our client
-        _ = client.connected_peer_count.fetchAdd(1, .seq_cst);
-        defer _ = client.connected_peer_count.fetchSub(1, .seq_cst);
+        _ = self.client.connected_peer_count.fetchAdd(1, .seq_cst);
+        defer _ = self.client.connected_peer_count.fetchSub(1, .seq_cst);
 
         // begin read loop
         self.readLoop(rt, &reader);
@@ -722,10 +741,10 @@ pub const PeerConnection = struct {
                 },
                 .sharedFileList => |msg| {
                     std.log.debug("\tReceived {s}'s file list", .{self.username});
-                    should_deinit = false;
 
-                    // send response in oneshot channel, if someone is waiting
+                    // if someone is waiting, send response in oneshot channel
                     if (self.shared_file_list_channel) |channel| {
+                        should_deinit = false;
                         channel.send(rt, msg) catch |err| {
                             std.log.err("\tError sending shared file list response in oneshot channel: {}", .{err});
                             should_deinit = true;
@@ -735,10 +754,21 @@ pub const PeerConnection = struct {
                 },
                 .fileSearchResponse => |msg| {
                     std.log.debug("\tReceived {s}'s file search response for our query {d}", .{ self.username, msg.token });
-                    should_deinit = true; // TODO: flip to false when proper channel for streaming results back to caller is implemented
 
-                    // print some info
-                    std.log.info("\t{s} has {d} matching files", .{ self.username, msg.files.len });
+                    // get corresponding search channel
+                    self.client.search_mutex.lock();
+                    const search_channel = self.client.search_result_channels.get(msg.token);
+                    self.client.search_mutex.unlock();
+
+                    // if channel exists, send response
+                    if (search_channel) |channel| {
+                        should_deinit = false; // responsibility of receiver to deinit the response
+                        channel.send(rt, msg) catch |err| {
+                            std.log.err("\tError sending file search response in channel: {}", .{err});
+                            should_deinit = true;
+                            continue;
+                        };
+                    }
                 },
                 .getUserInfo => {
                     std.log.debug("\t{s} requests our user info", .{self.username});

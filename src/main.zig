@@ -112,10 +112,13 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                             print(rt, "[error] syntax: search <query>\n", .{});
                         }
 
-                        client.fileSearch(rt, query) catch |err| {
+                        const channel = client.fileSearch(rt, query) catch |err| {
                             std.log.err("Could not search network for file: {}", .{err});
                             continue;
                         };
+
+                        var task = try rt.spawn(printSearchResults, .{ rt, allocator, channel });
+                        task.detach(rt);
                     },
                     Command.userinfo => {
                         const user = it.next() orelse {
@@ -124,7 +127,7 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                         };
 
                         var user_info = client.getUserInfo(rt, user) catch |err| {
-                            std.log.err("likely could not connect to user. error: {}", .{err});
+                            std.log.err("Likely could not connect to user. error: {}", .{err});
                             continue;
                         };
                         defer user_info.deinit(allocator);
@@ -137,6 +140,20 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                 print(rt, "[error] unknown command.\n", .{});
             }
         }
+    }
+}
+
+/// Prints search results from a channel as they come in.
+fn printSearchResults(rt: *zio.Runtime, allocator: std.mem.Allocator, channel: *zio.Channel(zslsk.messages.FileSearchResponseMessage)) void {
+    while (channel.receive(rt)) |msg| {
+        defer msg.deinit(allocator);
+        print(rt, "== user {s} | count {d} | speed {d} ==\n", .{ msg.username, msg.files.len, msg.avg_speed });
+        for (msg.files) |file| {
+            print(rt, "\t-> {s} ({d}B)\n", .{ file.name, file.size });
+        }
+    } else |err| switch (err) {
+        error.ChannelClosed => print(rt, "Search complete.\n", .{}),
+        else => std.log.err("Failed to receive from channel: {}", .{err}),
     }
 }
 
