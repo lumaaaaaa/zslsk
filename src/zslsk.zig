@@ -18,6 +18,7 @@ pub const Client = struct {
     peers: std.StringHashMap(*PeerConnection), // established peer connections
     peers_mutex: std.Thread.Mutex = .{},
     own_username: ?[]const u8,
+    connected_peer_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     // group for peer task execution
     peer_group: ?*zio.Group,
@@ -112,7 +113,7 @@ pub const Client = struct {
     /// Gets user info of the user with the specified username.
     pub fn getUserInfo(self: *Client, rt: *zio.Runtime, username: []const u8) !messages.UserInfoMessage {
         // get the peer
-        const conn = try self.getPeer(rt, username);
+        const conn = try self.getOrCreatePeer(rt, username);
 
         // get user info
         return try conn.getUserInfo(rt);
@@ -121,7 +122,7 @@ pub const Client = struct {
     /// Gets shared file list of the user with the specified username.
     pub fn getSharedFileList(self: *Client, rt: *zio.Runtime, username: []const u8) !messages.SharedFileListMessage {
         // get the peer
-        const conn = try self.getPeer(rt, username);
+        const conn = try self.getOrCreatePeer(rt, username);
 
         // get user info
         return try conn.getSharedFileList(rt);
@@ -304,24 +305,43 @@ pub const Client = struct {
         var msg = resp;
         defer msg.deinit(self.allocator);
 
-        // check for existing p2p connection
-        self.peers_mutex.lock();
-        const existing_conn = self.peers.get(msg.username);
-        self.peers_mutex.unlock();
-
-        if (existing_conn) |_| {
-            std.log.debug("Connection to peer {s} already exists", .{msg.username});
-            return;
-        }
-
         // TODO: handle different connection types
         const connection_type = std.meta.stringToEnum(types.ConnectionType, msg.type);
         switch (connection_type.?) {
             // p2p
             types.ConnectionType.P => |conn_type| {
+                self.peers_mutex.lock();
+                const peer_gop = self.peers.getOrPut(msg.username) catch |err| {
+                    std.log.err("Error getting peer: {}", .{err});
+                    return;
+                };
+                if (peer_gop.found_existing) {
+                    // peer with username exists
+                    self.peers_mutex.unlock();
+                    return;
+                }
+
+                // new peer
+                const peer = PeerConnection.init(self.allocator, msg.username, self.own_username.?, msg.token, conn_type) catch |err| {
+                    std.log.err("Error initializing peer: {}", .{err});
+                    _ = self.peers.remove(msg.username);
+                    self.peers_mutex.unlock();
+                    return;
+                };
+
+                // update hashmap ptrs before releasing lock
+                peer_gop.key_ptr.* = peer.username; // update key to peer owned memory
+                peer_gop.value_ptr.* = peer;
+                self.peers_mutex.unlock();
+
                 // connect to peer
-                const peer = self.createPeerConnection(rt, msg.ip, @intCast(msg.port), msg.username, msg.token, conn_type) catch |err| {
-                    std.log.err("Error connecting to peer: {}", .{err});
+                peer.connect(rt, msg.ip, @intCast(msg.port)) catch |err| {
+                    std.log.debug("Error connecting to peer: {}", .{err}); // this error is debug log level because timeouts will flood the terminal
+                    self.peers_mutex.lock();
+                    _ = self.peers.remove(msg.username);
+                    self.peers_mutex.unlock();
+                    peer.deinit(rt); // peer is not yet running, deinit
+                    self.allocator.destroy(peer);
                     return;
                 };
 
@@ -340,56 +360,49 @@ pub const Client = struct {
     }
 
     // Gets an existing PeerConnection, or establishes one if needed.
-    fn getPeer(self: *Client, rt: *zio.Runtime, username: []const u8) !*PeerConnection {
-        // first, see if we need to establish a connection with this peer
+    fn getOrCreatePeer(self: *Client, rt: *zio.Runtime, username: []const u8) !*PeerConnection {
         self.peers_mutex.lock();
-        const existing_conn_or_null = self.peers.get(username);
+        const peer_gop = try self.peers.getOrPut(username);
+        if (peer_gop.found_existing) {
+            // peer with username exists
+            self.peers_mutex.unlock();
+            return peer_gop.value_ptr.*;
+        }
+
+        // new peer
+        const peer = PeerConnection.init(self.allocator, username, self.own_username.?, 0, .P) catch |err| {
+            _ = self.peers.remove(username);
+            self.peers_mutex.unlock();
+            return err;
+        };
+
+        // update hashmap ptrs before releasing lock
+        peer_gop.key_ptr.* = peer.username; // update key to peer owned memory
+        peer_gop.value_ptr.* = peer;
         self.peers_mutex.unlock();
 
-        if (existing_conn_or_null) |conn| return conn;
-        // we need to connect to this peer
-        // attempt a direct connection first
-
-        // request peer address
-        const get_peer_address_resp = try self.getPeerAddress(rt, username);
+        // resolve peer address
+        const get_peer_address_resp = self.getPeerAddress(rt, username) catch |err| {
+            self.peers_mutex.lock();
+            _ = self.peers.remove(username);
+            self.peers_mutex.unlock();
+            peer.deinit(rt); // peer is not yet running, deinit
+            self.allocator.destroy(peer);
+            return err;
+        };
 
         // connect to peer
-        const peer = try self.createPeerConnection(rt, get_peer_address_resp.ip, @intCast(get_peer_address_resp.port), username, 0, .P);
+        peer.connect(rt, get_peer_address_resp.ip, @intCast(get_peer_address_resp.port)) catch |err| {
+            self.peers_mutex.lock();
+            _ = self.peers.remove(username);
+            self.peers_mutex.unlock();
+            peer.deinit(rt); // peer is not yet running, deinit
+            self.allocator.destroy(peer);
+            return err;
+        };
 
         // spawn peer and run
         try self.spawnPeer(rt, peer, true);
-
-        return peer;
-    }
-
-    // Creates a peer connection and registers it. Does NOT start the read loop.
-    fn createPeerConnection(self: *Client, rt: *zio.Runtime, ip: [4]u8, port: u16, username: []const u8, token: u32, connection_type: types.ConnectionType) !*PeerConnection {
-        std.log.debug("Establishing {s} connection with {s} @ {d}.{d}.{d}.{d}:{d}...", .{
-            @tagName(connection_type),
-            username,
-            ip[0],
-            ip[1],
-            ip[2],
-            ip[3],
-            port,
-        });
-
-        // connect to host
-        const address = zio.net.IpAddress.initIp4(ip, port);
-        const socket = try zio.net.tcpConnectToAddress(rt, address, .{
-            .timeout = .{ .duration = .fromSeconds(20) },
-        });
-
-        errdefer socket.close(rt);
-
-        // create PeerConnection
-        const peer = try PeerConnection.init(self.allocator, socket, username, self.own_username.?, token, connection_type);
-        errdefer peer.deinit(rt);
-
-        // add to peer map
-        self.peers_mutex.lock();
-        try self.peers.put(peer.username, peer);
-        self.peers_mutex.unlock();
 
         return peer;
     }
@@ -405,12 +418,15 @@ pub const Client = struct {
 
     // Runs the peer.
     fn runPeer(self: *Client, rt: *zio.Runtime, peer: *PeerConnection, we_initiated: bool) void {
-        defer {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            _ = self.peers.remove(peer.username);
-        }
-        peer.run(rt, we_initiated);
+        peer.run(rt, self, we_initiated);
+
+        // cleanup
+        self.peers_mutex.lock();
+        _ = self.peers.remove(peer.username);
+        std.log.info("There are now {d} active P2P connections.", .{self.connected_peer_count.load(.seq_cst)});
+        self.peers_mutex.unlock();
+        peer.deinit(rt);
+        self.allocator.destroy(peer);
     }
 
     // Sends a message to the connected server.
@@ -448,7 +464,7 @@ pub const Client = struct {
             104 => .{ .wishlistSearch = try messages.WishlistSearchResponse.parse(&reader.interface) },
             160 => .{ .excludedSearchPhrases = try messages.ExcludedSearchPhrasesResponse.parse(&reader.interface, self.allocator) },
             else => {
-                std.log.warn("server readResponse dropped an unknown message. code: {d}, length: {d}", .{ message_code, payload_len });
+                std.log.warn("Server readResponse dropped an unknown message. code: {d}, length: {d}", .{ message_code, payload_len });
 
                 // discard remaining unknown message bytes
                 const remaining: usize = payload_len - 4;
@@ -467,7 +483,7 @@ pub const PeerConnection = struct {
     own_username: []const u8,
     token: u32,
     connection_type: types.ConnectionType,
-    socket: zio.net.Stream,
+    socket: ?zio.net.Stream,
 
     // oneshot channels for request-response
     user_info_channel: ?*zio.Channel(messages.UserInfoMessage) = null,
@@ -479,11 +495,11 @@ pub const PeerConnection = struct {
     // connection state
     connection_state: std.atomic.Value(ConnectionState) = std.atomic.Value(ConnectionState).init(.disconnected),
 
-    pub fn init(allocator: std.mem.Allocator, socket: zio.net.Stream, username: []const u8, own_username: []const u8, token: u32, connection_type: types.ConnectionType) !*PeerConnection {
+    pub fn init(allocator: std.mem.Allocator, username: []const u8, own_username: []const u8, token: u32, connection_type: types.ConnectionType) !*PeerConnection {
         const pc = try allocator.create(PeerConnection);
         pc.* = .{
             .allocator = allocator,
-            .socket = socket,
+            .socket = null,
             .username = try allocator.dupe(u8, username),
             .own_username = try allocator.dupe(u8, own_username),
             .token = token,
@@ -497,16 +513,34 @@ pub const PeerConnection = struct {
         self.connection_state.store(.disconnected, .seq_cst);
         self.allocator.free(self.username);
         self.allocator.free(self.own_username);
-        self.socket.close(rt);
+        if (self.socket) |s| s.close(rt);
+        if (self.user_info_channel) |c| c.close(.graceful);
+        if (self.shared_file_list_channel) |c| c.close(.graceful);
+    }
+
+    pub fn connect(self: *PeerConnection, rt: *zio.Runtime, ip: [4]u8, port: u16) !void {
+        std.log.debug("Establishing {s} connection with {s} @ {d}.{d}.{d}.{d}:{d}...", .{
+            @tagName(self.connection_type),
+            self.username,
+            ip[0],
+            ip[1],
+            ip[2],
+            ip[3],
+            port,
+        });
+
+        // connect to host
+        const address = zio.net.IpAddress.initIp4(ip, port);
+        self.socket = try zio.net.tcpConnectToAddress(rt, address, .{
+            .timeout = .{ .duration = .fromSeconds(20) },
+        });
     }
 
     // Self-contained peer connection logic.
-    pub fn run(self: *PeerConnection, rt: *zio.Runtime, we_initiated: bool) void {
-        defer self.deinit(rt);
-
+    pub fn run(self: *PeerConnection, rt: *zio.Runtime, client: *Client, we_initiated: bool) void {
         // reader for socket
         var read_buf: [4096]u8 = undefined;
-        var reader = self.socket.reader(rt, &read_buf);
+        var reader = self.socket.?.reader(rt, &read_buf);
 
         // send correct handshake
         if (we_initiated) {
@@ -534,6 +568,10 @@ pub const PeerConnection = struct {
         // handshake done, good to go
         std.log.debug("Handshake complete with {s}, beginning read loop", .{self.username});
         self.connection_state.store(.connected, .seq_cst);
+
+        // update metrics in our client
+        _ = client.connected_peer_count.fetchAdd(1, .seq_cst);
+        defer _ = client.connected_peer_count.fetchSub(1, .seq_cst);
 
         // begin read loop
         self.readLoop(rt, &reader);
@@ -636,9 +674,10 @@ pub const PeerConnection = struct {
             var message = self.readResponse(reader) catch |err| {
                 if (err == error.EndOfStream) {
                     std.log.debug("Peer {s} disconnected", .{self.username});
+                    self.connection_state.store(.disconnected, .seq_cst);
                     return;
                 }
-                std.log.debug("err: {}", .{err});
+                std.log.err("Error encountered in peer readResponse: {}", .{err});
                 continue;
             };
 
@@ -653,7 +692,7 @@ pub const PeerConnection = struct {
                     std.log.debug("\t{s} requests our shared files", .{self.username});
 
                     const files = self.allocator.alloc(messages.SharedFile, 1) catch continue;
-
+                    defer self.allocator.free(files);
                     files[0] = .{
                         .code = 1,
                         .name = "hello_world.zig",
@@ -663,6 +702,7 @@ pub const PeerConnection = struct {
                     };
 
                     const dirs = self.allocator.alloc(messages.SharedDirectory, 1) catch continue;
+                    defer self.allocator.free(dirs);
                     dirs[0] = .{
                         .name = "zslsk\\files",
                         .files = files,
@@ -698,9 +738,7 @@ pub const PeerConnection = struct {
                     should_deinit = true; // TODO: flip to false when proper channel for streaming results back to caller is implemented
 
                     // print some info
-                    for (msg.files) |*file| {
-                        std.log.debug("\t{s} ({d} bytes)", .{ file.name, file.size });
-                    }
+                    std.log.info("\t{s} has {d} matching files", .{ self.username, msg.files.len });
                 },
                 .getUserInfo => {
                     std.log.debug("\t{s} requests our user info", .{self.username});
@@ -743,7 +781,7 @@ pub const PeerConnection = struct {
 
         // create buffered writer
         var write_buf: [4096]u8 = undefined;
-        var writer = self.socket.writer(rt, &write_buf);
+        var writer = self.socket.?.writer(rt, &write_buf);
         const writer_interface = &writer.interface;
         try msg.write(writer_interface);
         try writer_interface.flush();
@@ -755,7 +793,7 @@ pub const PeerConnection = struct {
 
         // create buffered writer
         var write_buf: [4096]u8 = undefined;
-        var writer = self.socket.writer(rt, &write_buf);
+        var writer = self.socket.?.writer(rt, &write_buf);
         const writer_interface = &writer.interface;
         try msg.write(self.allocator, writer_interface);
         try writer_interface.flush();

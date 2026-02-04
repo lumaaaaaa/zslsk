@@ -586,14 +586,21 @@ pub const FileSearchResponseMessage = struct {
         var decompressor = std.compress.flate.Decompress.init(reader, .zlib, &buf);
 
         const username = try readString(allocator, &decompressor.reader);
+        errdefer allocator.free(username);
         const token = try decompressor.reader.takeInt(u32, .little);
 
         const file_count = try decompressor.reader.takeInt(u32, .little);
         const files = try allocator.alloc(SharedFile, file_count);
-        errdefer allocator.free(files);
+        var files_parsed: usize = 0;
+        errdefer {
+            for (files[0..files_parsed]) |*file| {
+                file.deinit(allocator);
+            }
+            allocator.free(files);
+        }
         for (files) |*file| {
             file.* = try SharedFile.parse(allocator, &decompressor.reader);
-            errdefer file.deinit(allocator);
+            files_parsed += 1;
         }
 
         const slots_free = (try decompressor.reader.takeByte() == 1);
@@ -601,14 +608,20 @@ pub const FileSearchResponseMessage = struct {
         const queue_len = try decompressor.reader.takeInt(u32, .little);
 
         // official clients read u32 0
-        _ = try decompressor.reader.takeByte();
+        _ = try decompressor.reader.takeInt(u32, .little);
 
         const priv_file_count = try decompressor.reader.takeInt(u32, .little);
         const private_files = try allocator.alloc(SharedFile, priv_file_count);
-        errdefer allocator.free(private_files);
+        var priv_files_parsed: usize = 0;
+        errdefer {
+            for (private_files[0..priv_files_parsed]) |*file| {
+                file.deinit(allocator);
+            }
+            allocator.free(private_files);
+        }
         for (private_files) |*file| {
             file.* = try SharedFile.parse(allocator, &decompressor.reader);
-            errdefer file.deinit(allocator);
+            priv_files_parsed += 1;
         }
 
         return FileSearchResponseMessage{
@@ -679,13 +692,20 @@ pub const SharedDirectory = struct {
 
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !SharedDirectory {
         const name = try readString(allocator, reader);
+        errdefer allocator.free(name);
+
         const file_count = try reader.takeInt(u32, .little);
         const files = try allocator.alloc(SharedFile, file_count);
-        errdefer allocator.free(files);
-
+        var files_parsed: usize = 0;
+        errdefer {
+            for (files[0..files_parsed]) |*file| {
+                file.deinit(allocator);
+            }
+            allocator.free(files);
+        }
         for (files) |*file| {
             file.* = try SharedFile.parse(allocator, reader);
-            errdefer file.deinit(allocator);
+            files_parsed += 1;
         }
 
         return SharedDirectory{
@@ -720,12 +740,14 @@ pub const SharedFile = struct {
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !SharedFile {
         const code = try reader.takeByte();
         const name = try readString(allocator, reader);
+        errdefer allocator.free(name);
         const size = try reader.takeInt(u64, .little);
         const extension = try readString(allocator, reader);
+        errdefer allocator.free(extension);
+
         const attribute_count = try reader.takeInt(u32, .little);
         const attributes = try allocator.alloc(FileAttributes, attribute_count);
         errdefer allocator.free(attributes);
-
         for (attributes) |*attribute| {
             attribute.*.code = try reader.takeInt(u32, .little);
             attribute.*.value = try reader.takeInt(u32, .little);
