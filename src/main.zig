@@ -8,6 +8,7 @@ const PORT: u16 = 2242;
 const LISTEN_PORT: u16 = 22340;
 
 const Command = enum {
+    download, // downloads a target file from a target username (ex. download <username> <filename>)
     filelist, // retrieves file list for a target username (ex. filelist <username>)
     msg, // sends a message to a target user (ex. msg <username> <content>)
     search, // searches network for files matching a target query (ex. search <query>)
@@ -69,6 +70,23 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
 
             if (cmd_or_null) |cmd| {
                 switch (cmd) {
+                    Command.download => {
+                        const user = it.next() orelse {
+                            print(rt, "[error] syntax: download <username> <filename>\n", .{});
+                            continue;
+                        };
+
+                        const filename = it.rest();
+                        if (filename.len == 0) {
+                            print(rt, "[error] syntax: download <username> <filename>\n", .{});
+                            continue;
+                        }
+
+                        client.downloadFile(rt, user, filename) catch |err| {
+                            std.log.err("Could not download file: {}", .{err});
+                            continue;
+                        };
+                    },
                     Command.filelist => {
                         const user = it.next() orelse {
                             print(rt, "[error] syntax: filelist <username>\n", .{});

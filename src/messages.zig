@@ -460,6 +460,8 @@ pub const PeerMessage = union(enum(u32)) {
     fileSearchResponse: FileSearchResponseMessage = 9,
     getUserInfo: EmptyMessage = 15,
     userInfo: UserInfoMessage = 16,
+    transferRequest: TransferRequestMessage = 40,
+    queueUpload: QueueUploadMessage = 43,
 
     pub fn deinit(self: *PeerMessage, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -517,10 +519,15 @@ pub const SharedFileListMessage = struct {
         allocator.free(self.private_directories);
     }
 
-    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !SharedFileListMessage {
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader, payload_len: u32) !SharedFileListMessage {
+        // read full compressed payload
+        const compressed_len = payload_len - 4;
+        const compressed = try reader.readAlloc(allocator, compressed_len);
+        var fixed = std.Io.Reader.fixed(compressed);
+
         // message is zlib compressed
         var buf: [std.compress.flate.max_window_len]u8 = undefined;
-        var decompressor = std.compress.flate.Decompress.init(reader, .zlib, &buf);
+        var decompressor = std.compress.flate.Decompress.init(&fixed, .zlib, &buf);
 
         const dir_count = try decompressor.reader.takeInt(u32, .little);
         const directories = try allocator.alloc(SharedDirectory, dir_count);
@@ -606,10 +613,15 @@ pub const FileSearchResponseMessage = struct {
         allocator.free(self.private_files);
     }
 
-    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !FileSearchResponseMessage {
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader, payload_len: u32) !FileSearchResponseMessage {
+        // read full compressed payload
+        const compressed_len = payload_len - 4;
+        const compressed = try reader.readAlloc(allocator, compressed_len);
+        var fixed = std.Io.Reader.fixed(compressed);
+
         // message is zlib compressed
         var buf: [std.compress.flate.max_window_len]u8 = undefined;
-        var decompressor = std.compress.flate.Decompress.init(reader, .zlib, &buf);
+        var decompressor = std.compress.flate.Decompress.init(&fixed, .zlib, &buf);
 
         const username = try readString(allocator, &decompressor.reader);
         errdefer allocator.free(username);
@@ -862,6 +874,65 @@ pub const UserInfoMessage = struct {
         try writer.writeInt(u32, self.queue_size, .little);
         try writer.writeByte(@intFromBool(self.slots_free));
         try writer.writeInt(u32, @intFromEnum(self.upload_permitted), .little);
+    }
+};
+
+/// Represents peer code 40, a message to initiate a transfer.
+pub const TransferRequestMessage = struct {
+    direction: TransferDirection,
+    token: u32,
+    filename: []const u8,
+    size: u64,
+
+    const TransferDirection = enum(u32) {
+        downloadFromPeer = 0,
+        uploadToPeer = 1,
+    };
+
+    pub fn deinit(self: *TransferRequestMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.filename);
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !TransferRequestMessage {
+        const direction: TransferDirection = @enumFromInt(try reader.takeInt(u32, .little));
+        const token = try reader.takeInt(u32, .little);
+        const filename = try readString(allocator, reader);
+        const size = if (direction == .uploadToPeer) try reader.takeInt(u64, .little) else 0;
+
+        return TransferRequestMessage{
+            .direction = direction,
+            .token = token,
+            .filename = filename,
+            .size = size,
+        };
+    }
+
+    pub fn write(self: TransferRequestMessage, writer: *std.Io.Writer) !void {
+        try writer.writeInt(u32, @intFromEnum(self.direction), .little);
+        try writer.writeInt(u32, self.token, .little);
+        try writeString(self.filename, writer);
+        if (self.direction == .uploadToPeer) try writer.writeInt(u64, self.size, .little);
+    }
+};
+
+/// Represents peer code 43, a message to queue an upload.
+pub const QueueUploadMessage = struct {
+    filename: []const u8,
+
+    pub fn deinit(self: *QueueUploadMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.filename);
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !QueueUploadMessage {
+        const filename = try readString(allocator, reader);
+
+        return QueueUploadMessage{
+            .filename = filename,
+        };
+    }
+
+    pub fn write(self: QueueUploadMessage, writer: *std.Io.Writer) !void {
+        try writeString(self.filename, writer);
     }
 };
 

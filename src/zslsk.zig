@@ -165,10 +165,10 @@ pub const Client = struct {
     /// Gets shared file list of the user with the specified username.
     pub fn getSharedFileList(self: *Client, rt: *zio.Runtime, username: []const u8) !messages.SharedFileListMessage {
         // get the peer
-        const conn = try self.getOrCreatePeer(rt, username);
+        const peer = try self.getOrCreatePeer(rt, username);
 
         // get user info
-        return try conn.getSharedFileList(rt);
+        return try peer.getSharedFileList(rt);
     }
 
     /// Searches network for files matching a specified query.
@@ -211,6 +211,15 @@ pub const Client = struct {
         try self.sendMessage(rt, .{ .fileSearch = file_search_msg });
 
         return search_channel;
+    }
+
+    /// Requests a specified file from the peer with specified username.
+    pub fn downloadFile(self: *Client, rt: *zio.Runtime, username: []const u8, filename: []const u8) !void {
+        // get the peer
+        const peer = try self.getOrCreatePeer(rt, username);
+
+        // request download
+        try peer.queueDownload(rt, filename);
     }
 
     /// Sends a direct message to a user through the centralized server.
@@ -549,6 +558,7 @@ pub const PeerConnection = struct {
     // oneshot channels for request-response
     user_info_channel: ?*zio.Channel(messages.UserInfoMessage) = null,
     shared_file_list_channel: ?*zio.Channel(messages.SharedFileListMessage) = null,
+    transfer_request_channel: ?*zio.Channel(messages.TransferRequestMessage) = null,
 
     // mutex for channel access
     channels_mutex: std.Thread.Mutex = .{},
@@ -701,6 +711,21 @@ pub const PeerConnection = struct {
         return channel.receive(rt);
     }
 
+    pub fn queueDownload(self: *PeerConnection, rt: *zio.Runtime, filename: []const u8) !void {
+        // wait for handshake
+        while (self.connection_state.load(.seq_cst) != .connected) {
+            try rt.sleep(.fromMilliseconds(1));
+        }
+
+        // create oneshot channel for request-response
+        var one: [1]messages.SharedFileListMessage = undefined;
+        var channel = zio.Channel(messages.SharedFileListMessage).init(&one);
+        defer channel.close(.graceful);
+
+        // ask peer to queue download
+        try self.sendPeerMessage(rt, .{ .queueUpload = .{ .filename = filename } });
+    }
+
     // Peer message handler.
     fn readResponse(self: *PeerConnection, reader: *zio.net.Stream.Reader) !messages.PeerMessage {
         // TODO: handle error when socket is closed
@@ -713,12 +738,14 @@ pub const PeerConnection = struct {
         // handoff to relevant parser
         return switch (message_code) {
             4 => .{ .getSharedFileList = try messages.EmptyMessage.parse(self.allocator, &reader.interface) },
-            5 => .{ .sharedFileList = try messages.SharedFileListMessage.parse(self.allocator, &reader.interface) },
-            9 => .{ .fileSearchResponse = try messages.FileSearchResponseMessage.parse(self.allocator, &reader.interface) },
+            5 => .{ .sharedFileList = try messages.SharedFileListMessage.parse(self.allocator, &reader.interface, payload_len) },
+            9 => .{ .fileSearchResponse = try messages.FileSearchResponseMessage.parse(self.allocator, &reader.interface, payload_len) },
             15 => .{ .getUserInfo = try messages.EmptyMessage.parse(self.allocator, &reader.interface) },
             16 => .{ .userInfo = try messages.UserInfoMessage.parse(self.allocator, &reader.interface, start_seek, payload_len) },
+            40 => .{ .transferRequest = try messages.TransferRequestMessage.parse(self.allocator, &reader.interface) },
+            43 => .{ .queueUpload = try messages.QueueUploadMessage.parse(self.allocator, &reader.interface) },
             else => {
-                std.log.warn("Peer readResponse dropped an unknown message. code: {d}, length: {d}", .{ message_code, payload_len });
+                std.log.warn("Peer {s} readResponse dropped an unknown message. code: {d}, length: {d}", .{ self.username, message_code, payload_len });
 
                 // discard
                 const remaining: usize = payload_len - 4;
@@ -842,6 +869,14 @@ pub const PeerConnection = struct {
                             continue;
                         };
                     }
+                },
+                .transferRequest => |msg| {
+                    std.log.debug("\tReceived transfer request from {s}: {s} | {s} | {d}", .{ self.username, @tagName(msg.direction), msg.filename, msg.size });
+                    // TODO
+                },
+                .queueUpload => |msg| {
+                    std.log.debug("\t{s} requests file '{s}'", .{ self.username, msg.filename });
+                    // TODO
                 },
             }
         }
