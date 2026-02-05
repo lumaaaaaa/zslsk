@@ -6,11 +6,40 @@ It uses [zio](https://github.com/lalinsky/zio) under for efficient asynchronous 
 
 The library is under active development, and many features are currently missing.
 
-What has been implemented:
+## Status
 
-- [x] Basic app (in `main.zig`) demonstrating use of library with following commands: `download`, `filelist`, `msg`, `search`, `userinfo`, `exit`
+- [x] Basic app (in `main.zig`) demonstrating use of library with following commands:
+    - `download`
+    - `filelist`
+    - `msg`
+    - `search`
+    - `userinfo`
+    - `exit`
 - [x] Asynchronous library initialization (via `client.run(rt, HOST, PORT, username, password, LISTEN_PORT)`
-- [x] Server message parse/write (`Login`, `SetWaitPort`, `GetPeerAddress`, `ConnectToPeer`, `MessageUser`, `MessageAcked`, `FileSearch`, `RoomList`, `PrivilegedUsers`, `ParentMinSpeed`, `ParentSpeedRatio`, `WishlistSearch`, `ExcludedSearchPhrases`, `UploadSpeed`)
-- [x] Peer message parse/write (`PeerInit`, `PierceFireWall`, `GetSharedFileList`, `SharedFileList`, `FileSearchResponse`, `GetUserInfo`, `UserInfo`, `TransferRequest`, `QueueUpload`)
+- [x] Server message parse/write:
+    - `Login`
+    - `SetWaitPort`
+    - `GetPeerAddress`
+    - `ConnectToPeer`
+    - `MessageUser`
+    - `MessageAcked`
+    - `FileSearch`
+    - `RoomList`
+    - `PrivilegedUsers`
+    - `ParentMinSpeed`
+    - `ParentSpeedRatio`
+    - `WishlistSearch`
+    - `ExcludedSearchPhrases`
+    - `UploadSpeed`
+- [x] Peer message parse/write:
+    - `PeerInit`
+    - `PierceFireWall`
+    - `GetSharedFileList`
+    - `SharedFileList`
+    - `FileSearchResponse`
+    - `GetUserInfo`
+    - `UserInfo`
+    - `TransferRequest`
+    - `QueueUpload`
 
 The current focus of the project is to build out bare minimum functionality, and add more as the project matures. Roadmap coming soon.
