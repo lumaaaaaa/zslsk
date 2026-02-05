@@ -1,15 +1,16 @@
 # zslsk
 
-zslsk is a client library for the proprietary Soulseek protocol written in Zig.
+zslsk is a client-server library for the proprietary Soulseek protocol written in Zig.
 
-it uses [zio](https://github.com/lalinsky/zio) under the hood for efficient asynchronous I/O.
+It uses [zio](https://github.com/lalinsky/zio) under for efficient asynchronous I/O.
 
-currently, nearly all functionality does not work, though the library is under active development.
+The library is under active development, and many features are currently missing.
 
-what has been implemented:
+What has been implemented:
 
-- [x] Library initialization (via `client.connect(HOST, PORT, username, password, LISTEN_PORT)`, performs synchronous login then starts async message handler and listener for P2P connections)
-- [x] Initial async server message parsing (`RoomList`, `PrivilegedUsers`, `ParentMinSpeed`, `ParentSpeedRatio`, `WishlistSearch`, `ExcludedSearchPhrases`)
-- [x] Architecture to handle P2P client messages (currently just `UserInfoMessage`, in and out)
+- [x] Basic app (in `main.zig`) demonstrating use of library with following commands: `download`, `filelist`, `msg`, `search`, `userinfo`, `exit`
+- [x] Asynchronous library initialization (via `client.run(rt, HOST, PORT, username, password, LISTEN_PORT)`
+- [x] Server message parse/write (`Login`, `SetWaitPort`, `GetPeerAddress`, `ConnectToPeer`, `MessageUser`, `MessageAcked`, `FileSearch`, `RoomList`, `PrivilegedUsers`, `ParentMinSpeed`, `ParentSpeedRatio`, `WishlistSearch`, `ExcludedSearchPhrases`, `UploadSpeed`)
+- [x] Peer message parse/write (`PeerInit`, `PierceFireWall`, `GetSharedFileList`, `SharedFileList`, `FileSearchResponse`, `GetUserInfo`, `UserInfo`, `TransferRequest`, `QueueUpload`)
 
-the current focus of the project is to build out bare minimum functionality, and add more as the project matures. roadmap coming soon.
+The current focus of the project is to build out bare minimum functionality, and add more as the project matures. Roadmap coming soon.
