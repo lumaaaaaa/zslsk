@@ -396,7 +396,11 @@ pub const Client = struct {
 
                 // connect to peer
                 peer.connect(rt, msg.ip, @intCast(msg.port)) catch |err| {
-                    std.log.debug("Error connecting to peer: {}", .{err}); // this error is debug log level because timeouts will flood the terminal
+                    // cancellations and timeouts are normal behavior, no need to print anything
+                    if (err != error.Canceled and err != error.Timeout) {
+                        std.log.err("Error connecting to peer: {}", .{err});
+                    }
+
                     self.peers_mutex.lock();
                     _ = self.peers.remove(msg.username);
                     self.peers_mutex.unlock();
@@ -479,7 +483,7 @@ pub const Client = struct {
         // cleanup
         self.peers_mutex.lock();
         _ = self.peers.remove(peer.username);
-        std.log.info("There are now {d} active P2P connections.", .{self.connected_peer_count.load(.seq_cst)});
+        std.log.debug("Peer '{s}' disconnected. There are now {d} active P2P connections.", .{ peer.username, self.connected_peer_count.load(.seq_cst) });
         self.peers_mutex.unlock();
         peer.deinit(rt);
         self.allocator.destroy(peer);
@@ -730,8 +734,7 @@ pub const PeerConnection = struct {
     fn readLoop(self: *PeerConnection, rt: *zio.Runtime, reader: *zio.net.Stream.Reader) void {
         while (self.connection_state.load(.seq_cst) == .connected) {
             var message = self.readResponse(reader) catch |err| {
-                if (err == error.EndOfStream) {
-                    std.log.debug("Peer {s} disconnected", .{self.username});
+                if (err == error.EndOfStream or err == error.ReadFailed) {
                     self.connection_state.store(.disconnected, .seq_cst);
                     return;
                 }
