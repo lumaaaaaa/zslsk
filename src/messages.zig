@@ -8,8 +8,8 @@ pub const Message = union(enum(u32)) {
     getPeerAddress: GetPeerAddressMessage = 3,
     connectToPeer: ConnectToPeerMessage = 18,
     messageUser: MessageUserMessage = 22,
-    fileSearch: FileSearchMessage = 26,
     messageAcked: MessageAckedMessage = 23,
+    fileSearch: FileSearchMessage = 26,
     uploadSpeed: UploadSpeedMessage = 121,
 
     // Returns the relevant message code based on the enum value.
@@ -461,7 +461,9 @@ pub const PeerMessage = union(enum(u32)) {
     getUserInfo: EmptyMessage = 15,
     userInfo: UserInfoMessage = 16,
     transferRequest: TransferRequestMessage = 40,
+    transferResponse: TransferResponseMessage = 41,
     queueUpload: QueueUploadMessage = 43,
+    uploadFailed: UploadFailedMessage = 46,
 
     pub fn deinit(self: *PeerMessage, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -478,6 +480,7 @@ pub const PeerMessage = union(enum(u32)) {
     pub fn size(self: PeerMessage) !u32 {
         // get size of underlying message
         const msg_size = switch (self) {
+            inline .transferResponse => |msg| msg.calcSize(), // transfer responses must have size calculated dynamically
             inline else => |msg| calcSize(msg),
         };
 
@@ -523,6 +526,7 @@ pub const SharedFileListMessage = struct {
         // read full compressed payload
         const compressed_len = payload_len - 4;
         const compressed = try reader.readAlloc(allocator, compressed_len);
+        defer allocator.free(compressed);
         var fixed = std.Io.Reader.fixed(compressed);
 
         // message is zlib compressed
@@ -617,6 +621,7 @@ pub const FileSearchResponseMessage = struct {
         // read full compressed payload
         const compressed_len = payload_len - 4;
         const compressed = try reader.readAlloc(allocator, compressed_len);
+        defer allocator.free(compressed);
         var fixed = std.Io.Reader.fixed(compressed);
 
         // message is zlib compressed
@@ -884,11 +889,6 @@ pub const TransferRequestMessage = struct {
     filename: []const u8,
     size: u64,
 
-    const TransferDirection = enum(u32) {
-        downloadFromPeer = 0,
-        uploadToPeer = 1,
-    };
-
     pub fn deinit(self: *TransferRequestMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.filename);
     }
@@ -915,6 +915,55 @@ pub const TransferRequestMessage = struct {
     }
 };
 
+/// Represents peer code 41, a message to respond to a transfer.
+pub const TransferResponseMessage = struct {
+    token: u32,
+    allowed: bool,
+    size: u64,
+    reason: ?[]const u8,
+    direction: TransferDirection,
+
+    pub fn deinit(self: *TransferResponseMessage, allocator: std.mem.Allocator) void {
+        if (self.reason) |reason| allocator.free(reason);
+    }
+
+    pub fn calcSize(self: TransferResponseMessage) usize {
+        var size: usize = 4 + 1; // u32 (token) + u8 (bool)
+        if (self.direction == .downloadFromPeer and self.allowed) size += 8; // u64 (size)
+        if (self.reason) |reason| size += 4 + reason.len; // string (u32 len + []u8 data)
+
+        return size;
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader, direction: TransferDirection) !TransferResponseMessage {
+        const token = try reader.takeInt(u32, .little);
+        const allowed = (try reader.takeByte() == 1);
+        const size = if (direction == .downloadFromPeer and allowed) try reader.takeInt(u64, .little) else 0;
+        const reason = if (!allowed) try readString(allocator, reader) else null;
+
+        return TransferResponseMessage{
+            .token = token,
+            .allowed = allowed,
+            .size = size,
+            .reason = reason,
+            .direction = direction,
+        };
+    }
+
+    pub fn write(self: TransferResponseMessage, writer: *std.Io.Writer) !void {
+        try writer.writeInt(u32, self.token, .little);
+        try writer.writeByte(@intFromBool(self.allowed));
+        if (self.direction == .downloadFromPeer and self.allowed) try writer.writeInt(u64, self.size, .little);
+        if (self.reason) |reason| try writeString(reason, writer);
+    }
+};
+
+// Represents direction for TransferRequest and TransferResponse.
+const TransferDirection = enum(u32) {
+    downloadFromPeer = 0,
+    uploadToPeer = 1,
+};
+
 /// Represents peer code 43, a message to queue an upload.
 pub const QueueUploadMessage = struct {
     filename: []const u8,
@@ -932,6 +981,27 @@ pub const QueueUploadMessage = struct {
     }
 
     pub fn write(self: QueueUploadMessage, writer: *std.Io.Writer) !void {
+        try writeString(self.filename, writer);
+    }
+};
+
+/// Represents peer code 46, a message to queue an upload.
+pub const UploadFailedMessage = struct {
+    filename: []const u8,
+
+    pub fn deinit(self: *UploadFailedMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.filename);
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !UploadFailedMessage {
+        const filename = try readString(allocator, reader);
+
+        return UploadFailedMessage{
+            .filename = filename,
+        };
+    }
+
+    pub fn write(self: UploadFailedMessage, writer: *std.Io.Writer) !void {
         try writeString(self.filename, writer);
     }
 };

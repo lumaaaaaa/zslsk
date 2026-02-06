@@ -455,7 +455,7 @@ pub const Client = struct {
         self.peers_mutex.unlock();
 
         // resolve peer address
-        const get_peer_address_resp = self.getPeerAddress(rt, username) catch |err| {
+        var get_peer_address_resp = self.getPeerAddress(rt, username) catch |err| {
             self.peers_mutex.lock();
             _ = self.peers.remove(username);
             self.peers_mutex.unlock();
@@ -463,6 +463,7 @@ pub const Client = struct {
             self.allocator.destroy(peer);
             return err;
         };
+        defer get_peer_address_resp.deinit(self.allocator);
 
         // connect to peer
         peer.connect(rt, get_peer_address_resp.ip, @intCast(get_peer_address_resp.port)) catch |err| {
@@ -718,12 +719,38 @@ pub const PeerConnection = struct {
         }
 
         // create oneshot channel for request-response
-        var one: [1]messages.SharedFileListMessage = undefined;
-        var channel = zio.Channel(messages.SharedFileListMessage).init(&one);
+        var one: [1]messages.TransferRequestMessage = undefined;
+        var channel = zio.Channel(messages.TransferRequestMessage).init(&one);
         defer channel.close(.graceful);
+
+        // register
+        self.channels_mutex.lock();
+        self.transfer_request_channel = &channel;
+        self.channels_mutex.unlock();
+
+        // unregister on exit
+        defer {
+            self.channels_mutex.lock();
+            self.transfer_request_channel = null;
+            self.channels_mutex.unlock();
+        }
 
         // ask peer to queue download
         try self.sendPeerMessage(rt, .{ .queueUpload = .{ .filename = filename } });
+
+        // block until we receive a transfer response
+        var transfer_request_msg = try channel.receive(rt);
+        defer transfer_request_msg.deinit(self.allocator);
+
+        // respond to transfer response
+        const transfer_response_msg = messages.TransferResponseMessage{
+            .token = transfer_request_msg.token,
+            .allowed = true,
+            .size = 0,
+            .reason = null,
+            .direction = .uploadToPeer,
+        };
+        try self.sendPeerMessage(rt, .{ .transferResponse = transfer_response_msg });
     }
 
     // Peer message handler.
@@ -744,6 +771,7 @@ pub const PeerConnection = struct {
             16 => .{ .userInfo = try messages.UserInfoMessage.parse(self.allocator, &reader.interface, start_seek, payload_len) },
             40 => .{ .transferRequest = try messages.TransferRequestMessage.parse(self.allocator, &reader.interface) },
             43 => .{ .queueUpload = try messages.QueueUploadMessage.parse(self.allocator, &reader.interface) },
+            46 => .{ .uploadFailed = try messages.UploadFailedMessage.parse(self.allocator, &reader.interface) },
             else => {
                 std.log.warn("Peer {s} readResponse dropped an unknown message. code: {d}, length: {d}", .{ self.username, message_code, payload_len });
 
@@ -872,11 +900,32 @@ pub const PeerConnection = struct {
                 },
                 .transferRequest => |msg| {
                     std.log.debug("\tReceived transfer request from {s}: {s} | {s} | {d}", .{ self.username, @tagName(msg.direction), msg.filename, msg.size });
-                    // TODO
+                    should_deinit = false;
+
+                    // send request in oneshot channel, if someone is waiting
+                    if (self.transfer_request_channel) |channel| {
+                        channel.send(rt, msg) catch |err| {
+                            std.log.err("\tError sending transfer response in oneshot channel: {}", .{err});
+                            should_deinit = true;
+                            continue;
+                        };
+                    }
+                },
+                .transferResponse => |msg| {
+                    std.log.debug("\tReceived transfer response from {s}: token {d}", .{ self.username, msg.token });
+                    // TODO: establish file connection now
                 },
                 .queueUpload => |msg| {
                     std.log.debug("\t{s} requests file '{s}'", .{ self.username, msg.filename });
-                    // TODO
+                    // TODO: send transfer request
+                },
+                .uploadFailed => |msg| {
+                    std.log.debug("\tReceived upload failure from {s}: {s}", .{ self.username, msg.filename });
+
+                    // close oneshot channel, if someone is waiting
+                    if (self.transfer_request_channel) |channel| {
+                        channel.close(.graceful);
+                    }
                 },
             }
         }
