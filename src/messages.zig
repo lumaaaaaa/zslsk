@@ -464,6 +464,7 @@ pub const PeerMessage = union(enum(u32)) {
     transferResponse: TransferResponseMessage = 41,
     queueUpload: QueueUploadMessage = 43,
     uploadFailed: UploadFailedMessage = 46,
+    uploadDenied: UploadDeniedMessage = 50,
 
     pub fn deinit(self: *PeerMessage, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -1006,6 +1007,32 @@ pub const UploadFailedMessage = struct {
     }
 };
 
+/// Represents peer code 46, a message to queue an upload.
+pub const UploadDeniedMessage = struct {
+    filename: []const u8,
+    reason: []const u8,
+
+    pub fn deinit(self: *UploadDeniedMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.filename);
+        allocator.free(self.reason);
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !UploadDeniedMessage {
+        const filename = try readString(allocator, reader);
+        const reason = try readString(allocator, reader);
+
+        return UploadDeniedMessage{
+            .filename = filename,
+            .reason = reason,
+        };
+    }
+
+    pub fn write(self: UploadDeniedMessage, writer: *std.Io.Writer) !void {
+        try writeString(self.filename, writer);
+        try writeString(self.reason, writer);
+    }
+};
+
 /// Represents a Soulseek peer init message. These are generic. Enum value corresponds to the relevant message code.
 pub const PeerInitMessage = union(enum(u8)) {
     pierceFireWall: PierceFireWall = 0,
@@ -1085,6 +1112,55 @@ pub const PeerInit = struct {
         try writeString(self.username, writer);
         try writeString(self.type, writer);
         try writer.writeInt(u32, self.token, .little);
+    }
+};
+
+/// Represents a file connection message. Enum value corresponds to the relevant message code.
+pub const FileMessage = union(enum(u32)) {
+    fileTransferInit: FileTransferInitMessage = 1,
+    fileOffset: FileOffsetMessage = 2,
+
+    // Writes a message.
+    pub fn write(self: FileMessage, writer: *std.Io.Writer) !void {
+        // no length and message code
+
+        switch (self) {
+            inline else => |msg| try msg.write(writer), // call underlying write function in relevant message
+        }
+    }
+};
+
+/// Represents a message to initiate an upload over a file connection.
+pub const FileTransferInitMessage = struct {
+    token: u32,
+
+    pub fn parse(reader: *std.Io.Reader) !FileTransferInitMessage {
+        const token = try reader.takeInt(u32, .little);
+
+        return FileTransferInitMessage{
+            .token = token,
+        };
+    }
+
+    pub fn write(self: FileTransferInitMessage, writer: *std.Io.Writer) !void {
+        try writer.writeInt(u32, self.token, .little);
+    }
+};
+
+/// Represents a message to tell a peer how many bytes we have downloaded over a file connection.
+pub const FileOffsetMessage = struct {
+    offset: u64,
+
+    pub fn parse(reader: *std.Io.Reader) !FileOffsetMessage {
+        const offset = try reader.takeInt(u64, .little);
+
+        return FileOffsetMessage{
+            .offset = offset,
+        };
+    }
+
+    pub fn write(self: FileOffsetMessage, writer: *std.Io.Writer) !void {
+        try writer.writeInt(u64, self.offset, .little);
     }
 };
 

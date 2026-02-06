@@ -176,7 +176,7 @@ pub const Client = struct {
         // zig new std.Io to access std.Io.random
         var threaded = std.Io.Threaded.init(self.allocator, .{
             .environ = .empty,
-        }); // FIX: this is improper use of Zig's new std.Io. beyond that, it's also a mess and I hate it.
+        }); // HACK: short lived std.Io instance cause rt.io() panics :(
         defer threaded.deinit();
         const io = threaded.ioBasic();
 
@@ -214,12 +214,12 @@ pub const Client = struct {
     }
 
     /// Requests a specified file from the peer with specified username.
-    pub fn downloadFile(self: *Client, rt: *zio.Runtime, username: []const u8, filename: []const u8) !void {
+    pub fn downloadFile(self: *Client, rt: *zio.Runtime, username: []const u8, filepath: []const u8) ![]u8 {
         // get the peer
         const peer = try self.getOrCreatePeer(rt, username);
 
-        // request download
-        try peer.queueDownload(rt, filename);
+        // request download, return file content
+        return try peer.queueDownload(rt, filepath);
     }
 
     /// Sends a direct message to a user through the centralized server.
@@ -378,7 +378,8 @@ pub const Client = struct {
         const connection_type = std.meta.stringToEnum(types.ConnectionType, msg.type);
         switch (connection_type.?) {
             // p2p
-            types.ConnectionType.P => |conn_type| {
+            types.ConnectionType.P => {
+                // get peer
                 self.peers_mutex.lock();
                 const peer_gop = self.peers.getOrPut(msg.username) catch |err| {
                     std.log.err("Error getting peer: {}", .{err});
@@ -391,7 +392,7 @@ pub const Client = struct {
                 }
 
                 // new peer
-                const peer = PeerConnection.init(self.allocator, self, msg.username, self.own_username.?, msg.token, conn_type) catch |err| {
+                const peer = PeerConnection.init(self.allocator, self, msg.username, self.own_username.?, msg.token) catch |err| {
                     std.log.err("Error initializing peer: {}", .{err});
                     _ = self.peers.remove(msg.username);
                     self.peers_mutex.unlock();
@@ -406,8 +407,9 @@ pub const Client = struct {
                 // connect to peer
                 peer.connect(rt, msg.ip, @intCast(msg.port)) catch |err| {
                     // cancellations and timeouts are normal behavior, no need to print anything
+                    // honestly, this is debug log level for now since connection errors are common, not worth attention
                     if (err != error.Canceled and err != error.Timeout) {
-                        std.log.err("Error connecting to peer: {}", .{err});
+                        std.log.debug("Error connecting to peer: {}", .{err});
                     }
 
                     self.peers_mutex.lock();
@@ -423,8 +425,47 @@ pub const Client = struct {
                     std.log.err("Error spawning & running peer: {}", .{err});
                 };
             },
+            // file transfer
             types.ConnectionType.F => {
-                // file transfer
+                // get peer
+                self.peers_mutex.lock();
+                const peer = self.peers.get(msg.username) orelse {
+                    std.log.err("Error establishing file transfer connection with {s}, peer connection does not exist", .{msg.username});
+                    return;
+                };
+                self.peers_mutex.unlock();
+
+                // initialize new file connection
+                const file_conn = FileConnection.init(self.allocator, msg.username, msg.token) catch |err| {
+                    std.log.err("Error initializing file connection for {s}: {}", .{ msg.username, err });
+                    return;
+                };
+
+                // establish file connection
+                file_conn.connect(rt, msg.ip, @intCast(msg.port)) catch |err| {
+                    // cancellations and timeouts are normal behavior, no need to print anything
+                    if (err != error.Canceled and err != error.Timeout) {
+                        std.log.err("Error establishing file connection with {s}: {}", .{ msg.username, err });
+                    }
+                    file_conn.deinit(rt);
+                    self.allocator.destroy(file_conn);
+                    return;
+                };
+
+                // shoot file connection to peer (if waiting)
+                if (peer.file_connection_channel) |channel| {
+                    channel.send(rt, file_conn) catch |err| {
+                        std.log.err("Error sending file connection to peer {s}: {}", .{ msg.username, err });
+                        file_conn.deinit(rt);
+                        self.allocator.destroy(file_conn);
+                        return;
+                    };
+                } else {
+                    std.log.err("Error creating file connection for {s}: peer is not expecting file connection", .{msg.username});
+                    file_conn.deinit(rt);
+                    self.allocator.destroy(file_conn);
+                    return;
+                }
             },
             types.ConnectionType.D => {
                 // distributed network
@@ -443,7 +484,7 @@ pub const Client = struct {
         }
 
         // new peer
-        const peer = PeerConnection.init(self.allocator, self, username, self.own_username.?, 0, .P) catch |err| {
+        const peer = PeerConnection.init(self.allocator, self, username, self.own_username.?, 0) catch |err| {
             _ = self.peers.remove(username);
             self.peers_mutex.unlock();
             return err;
@@ -547,13 +588,88 @@ pub const Client = struct {
     }
 };
 
+pub const FileConnection = struct {
+    allocator: std.mem.Allocator,
+    username: []const u8,
+    token: u32,
+    socket: ?zio.net.Stream,
+
+    pub fn init(allocator: std.mem.Allocator, username: []const u8, token: u32) !*FileConnection {
+        const fc = try allocator.create(FileConnection);
+        fc.* = .{
+            .allocator = allocator,
+            .username = try allocator.dupe(u8, username),
+            .token = token,
+            .socket = null,
+        };
+        return fc;
+    }
+
+    pub fn deinit(self: *FileConnection, rt: *zio.Runtime) void {
+        self.allocator.free(self.username);
+        if (self.socket) |s| s.close(rt);
+    }
+
+    pub fn connect(self: *FileConnection, rt: *zio.Runtime, ip: [4]u8, port: u16) !void {
+        std.log.debug("Establishing file connection with {s} @ {d}.{d}.{d}.{d}:{d}...", .{
+            self.username,
+            ip[0],
+            ip[1],
+            ip[2],
+            ip[3],
+            port,
+        });
+
+        // connect to host
+        const address = zio.net.IpAddress.initIp4(ip, port);
+        self.socket = try zio.net.tcpConnectToAddress(rt, address, .{
+            .timeout = .{ .duration = .fromSeconds(20) },
+        });
+    }
+
+    // Reads a FileTransferInitMessage.
+    fn readFileTransferInitMessage(self: *FileConnection, reader: *zio.net.Stream.Reader) !messages.FileTransferInitMessage {
+        _ = self;
+        return try messages.FileTransferInitMessage.parse(&reader.interface);
+    }
+
+    // Reads a FileOffsetMessage.
+    fn readOffsetMessage(self: *FileConnection, reader: *zio.net.Stream.Reader) !messages.FileOffsetMessage {
+        _ = self;
+        return try messages.FileOffsetMessage.parse(&reader.interface);
+    }
+
+    // Sends one of the PeerInit messages: PierceFireWall or PeerInit.
+    fn sendPeerInitMessage(self: *FileConnection, rt: *zio.Runtime, msg: messages.PeerInitMessage) !void {
+        // TODO: handle error when socket is closed
+
+        // create buffered writer
+        var write_buf: [4096]u8 = undefined;
+        var writer = self.socket.?.writer(rt, &write_buf);
+        const writer_interface = &writer.interface;
+        try msg.write(writer_interface);
+        try writer_interface.flush();
+    }
+
+    // Sends a FileMessage to the peer.
+    fn sendFileMessage(self: *FileConnection, rt: *zio.Runtime, msg: messages.FileMessage) !void {
+        // TODO: handle error when socket is closed
+
+        // create buffered writer
+        var write_buf: [4096]u8 = undefined;
+        var writer = self.socket.?.writer(rt, &write_buf);
+        const writer_interface = &writer.interface;
+        try msg.write(writer_interface);
+        try writer_interface.flush();
+    }
+};
+
 pub const PeerConnection = struct {
     allocator: std.mem.Allocator,
     client: *Client,
     username: []const u8,
     own_username: []const u8,
     token: u32,
-    connection_type: types.ConnectionType,
     socket: ?zio.net.Stream,
 
     // oneshot channels for request-response
@@ -561,13 +677,16 @@ pub const PeerConnection = struct {
     shared_file_list_channel: ?*zio.Channel(messages.SharedFileListMessage) = null,
     transfer_request_channel: ?*zio.Channel(messages.TransferRequestMessage) = null,
 
+    // oneshot channel for file connections socket
+    file_connection_channel: ?*zio.Channel(*FileConnection) = null,
+
     // mutex for channel access
     channels_mutex: std.Thread.Mutex = .{},
 
     // connection state
     connection_state: std.atomic.Value(ConnectionState) = std.atomic.Value(ConnectionState).init(.disconnected),
 
-    pub fn init(allocator: std.mem.Allocator, client: *Client, username: []const u8, own_username: []const u8, token: u32, connection_type: types.ConnectionType) !*PeerConnection {
+    pub fn init(allocator: std.mem.Allocator, client: *Client, username: []const u8, own_username: []const u8, token: u32) !*PeerConnection {
         const pc = try allocator.create(PeerConnection);
         pc.* = .{
             .allocator = allocator,
@@ -576,7 +695,6 @@ pub const PeerConnection = struct {
             .username = try allocator.dupe(u8, username),
             .own_username = try allocator.dupe(u8, own_username),
             .token = token,
-            .connection_type = connection_type,
             .connection_state = std.atomic.Value(ConnectionState).init(.connecting),
         };
         return pc;
@@ -592,8 +710,7 @@ pub const PeerConnection = struct {
     }
 
     pub fn connect(self: *PeerConnection, rt: *zio.Runtime, ip: [4]u8, port: u16) !void {
-        std.log.debug("Establishing {s} connection with {s} @ {d}.{d}.{d}.{d}:{d}...", .{
-            @tagName(self.connection_type),
+        std.log.debug("Establishing peer connection with {s} @ {d}.{d}.{d}.{d}:{d}...", .{
             self.username,
             ip[0],
             ip[1],
@@ -619,7 +736,7 @@ pub const PeerConnection = struct {
         if (we_initiated) {
             const msg = messages.PeerInit{
                 .username = self.own_username,
-                .type = @tagName(self.connection_type),
+                .type = @tagName(types.ConnectionType.P),
                 .token = 0,
             };
 
@@ -712,20 +829,20 @@ pub const PeerConnection = struct {
         return channel.receive(rt);
     }
 
-    pub fn queueDownload(self: *PeerConnection, rt: *zio.Runtime, filename: []const u8) !void {
+    pub fn queueDownload(self: *PeerConnection, rt: *zio.Runtime, filepath: []const u8) ![]u8 {
         // wait for handshake
         while (self.connection_state.load(.seq_cst) != .connected) {
             try rt.sleep(.fromMilliseconds(1));
         }
 
         // create oneshot channel for request-response
-        var one: [1]messages.TransferRequestMessage = undefined;
-        var channel = zio.Channel(messages.TransferRequestMessage).init(&one);
-        defer channel.close(.graceful);
+        var xfer_one: [1]messages.TransferRequestMessage = undefined;
+        var xfer_channel = zio.Channel(messages.TransferRequestMessage).init(&xfer_one);
+        defer xfer_channel.close(.graceful);
 
         // register
         self.channels_mutex.lock();
-        self.transfer_request_channel = &channel;
+        self.transfer_request_channel = &xfer_channel;
         self.channels_mutex.unlock();
 
         // unregister on exit
@@ -736,11 +853,28 @@ pub const PeerConnection = struct {
         }
 
         // ask peer to queue download
-        try self.sendPeerMessage(rt, .{ .queueUpload = .{ .filename = filename } });
+        try self.sendPeerMessage(rt, .{ .queueUpload = .{ .filename = filepath } });
 
         // block until we receive a transfer response
-        var transfer_request_msg = try channel.receive(rt);
+        var transfer_request_msg = try xfer_channel.receive(rt);
         defer transfer_request_msg.deinit(self.allocator);
+
+        // create oneshot channel for file connection socket
+        var file_one: [1]*FileConnection = undefined;
+        var file_channel = zio.Channel(*FileConnection).init(&file_one);
+        defer file_channel.close(.graceful);
+
+        // register
+        self.channels_mutex.lock();
+        self.file_connection_channel = &file_channel;
+        self.channels_mutex.unlock();
+
+        // unregister on exit
+        defer {
+            self.channels_mutex.lock();
+            self.file_connection_channel = null;
+            self.channels_mutex.unlock();
+        }
 
         // respond to transfer response
         const transfer_response_msg = messages.TransferResponseMessage{
@@ -751,9 +885,51 @@ pub const PeerConnection = struct {
             .direction = .uploadToPeer,
         };
         try self.sendPeerMessage(rt, .{ .transferResponse = transfer_response_msg });
+
+        // wait for file connection
+        var file_conn = try file_channel.receive(rt);
+        defer file_conn.deinit(rt);
+        defer self.allocator.destroy(file_conn);
+
+        // reader for socket
+        var read_buf: [4096]u8 = undefined;
+        var reader = file_conn.socket.?.reader(rt, &read_buf);
+
+        // token determines how handshake goes. if nonzero, this was indirect
+        if (file_conn.token == 0) {
+            const peer_init_msg = messages.PeerInit{
+                .username = self.own_username,
+                .type = @tagName(types.ConnectionType.F),
+                .token = 0,
+            };
+
+            try file_conn.sendPeerInitMessage(rt, .{ .peerInit = peer_init_msg });
+        } else {
+            const pierce_firewall_msg = messages.PierceFireWall{
+                .token = file_conn.token,
+            };
+
+            try file_conn.sendPeerInitMessage(rt, .{ .pierceFireWall = pierce_firewall_msg });
+        }
+
+        // read file transfer init
+        const msg = try file_conn.readFileTransferInitMessage(&reader);
+        std.log.debug("FileTransferInit received for {s}: token={d}", .{ self.username, msg.token });
+
+        // tell the peer we have none of the file
+        const file_offset_msg = messages.FileOffsetMessage{
+            .offset = 0,
+        };
+        try file_conn.sendFileMessage(rt, .{ .fileOffset = file_offset_msg });
+
+        // read full file
+        const data = try reader.interface.readAlloc(self.allocator, transfer_request_msg.size);
+
+        // return data to caller
+        return data;
     }
 
-    // Peer message handler.
+    // Peer message parser.
     fn readResponse(self: *PeerConnection, reader: *zio.net.Stream.Reader) !messages.PeerMessage {
         // TODO: handle error when socket is closed
 
@@ -772,6 +948,7 @@ pub const PeerConnection = struct {
             40 => .{ .transferRequest = try messages.TransferRequestMessage.parse(self.allocator, &reader.interface) },
             43 => .{ .queueUpload = try messages.QueueUploadMessage.parse(self.allocator, &reader.interface) },
             46 => .{ .uploadFailed = try messages.UploadFailedMessage.parse(self.allocator, &reader.interface) },
+            50 => .{ .uploadDenied = try messages.UploadDeniedMessage.parse(self.allocator, &reader.interface) },
             else => {
                 std.log.warn("Peer {s} readResponse dropped an unknown message. code: {d}, length: {d}", .{ self.username, message_code, payload_len });
 
@@ -921,6 +1098,14 @@ pub const PeerConnection = struct {
                 },
                 .uploadFailed => |msg| {
                     std.log.debug("\tReceived upload failure from {s}: {s}", .{ self.username, msg.filename });
+
+                    // close oneshot channel, if someone is waiting
+                    if (self.transfer_request_channel) |channel| {
+                        channel.close(.graceful);
+                    }
+                },
+                .uploadDenied => |msg| {
+                    std.log.debug("\tReceived upload denied from {s}: File {s} | {s}", .{ self.username, msg.filename, msg.reason });
 
                     // close oneshot channel, if someone is waiting
                     if (self.transfer_request_channel) |channel| {

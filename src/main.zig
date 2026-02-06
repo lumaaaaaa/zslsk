@@ -64,6 +64,8 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
         const line = try readStdinLine(rt, allocator);
         defer allocator.free(line);
 
+        if (line.len == 0) continue;
+
         var it = std.mem.splitScalar(u8, line, ' ');
         if (it.next()) |cmd_str| {
             const cmd_or_null = std.meta.stringToEnum(Command, cmd_str);
@@ -76,16 +78,36 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                             continue;
                         };
 
-                        const filename = it.rest();
-                        if (filename.len == 0) {
+                        const filepath = it.rest();
+                        if (filepath.len == 0) {
                             print(rt, "[error] syntax: download <username> <filename>\n", .{});
                             continue;
                         }
 
-                        client.downloadFile(rt, user, filename) catch |err| {
+                        const data = client.downloadFile(rt, user, filepath) catch |err| {
                             std.log.err("Could not download file: {}", .{err});
                             continue;
                         };
+                        defer allocator.free(data);
+
+                        // zig new std.Io to access std.Io.random
+                        var threaded = std.Io.Threaded.init(allocator, .{
+                            .environ = .empty,
+                        }); // HACK: short lived std.Io instance cause rt.io() panics :(
+                        defer threaded.deinit();
+                        const io = threaded.ioBasic();
+
+                        const filename = std.fs.path.basenameWindows(filepath);
+                        const file = std.Io.Dir.cwd().createFile(io, filename, .{ .exclusive = true }) catch |err| {
+                            std.log.err("Could not create file: {}", .{err});
+                            continue;
+                        };
+
+                        _ = file.writeStreamingAll(io, data) catch |err| {
+                            std.log.err("Could not write file: {}", .{err});
+                        };
+
+                        print(rt, "[info] file downloaded to './{s}'\n", .{filename});
                     },
                     Command.filelist => {
                         const user = it.next() orelse {
@@ -167,7 +189,7 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
 fn printSearchResults(rt: *zio.Runtime, allocator: std.mem.Allocator, search_channel: zslsk.SearchChannel) void {
     while (search_channel.channel.receive(rt)) |msg| {
         defer msg.deinit(allocator);
-        print(rt, "== user {s} | count {d} | speed {d} ==\n", .{ msg.username, msg.files.len, msg.avg_speed });
+        print(rt, "== user {s} | count {d} | speed {B}/s ==\n", .{ msg.username, msg.files.len, msg.avg_speed });
         for (msg.files) |file| {
             print(rt, "\t-> {s} ({d}B)\n", .{ file.name, file.size });
         }
