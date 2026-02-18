@@ -10,6 +10,7 @@ pub const Message = union(enum(u32)) {
     messageUser: MessageUserMessage = 22,
     messageAcked: MessageAckedMessage = 23,
     fileSearch: FileSearchMessage = 26,
+    haveNoParent: HaveNoParentMessage = 71,
     uploadSpeed: UploadSpeedMessage = 121,
 
     // Returns the relevant message code based on the enum value.
@@ -113,6 +114,15 @@ pub const FileSearchMessage = struct {
     }
 };
 
+/// Represents server code 71, a message to tell the server if we have no parent.
+pub const HaveNoParentMessage = struct {
+    no_parent: bool,
+
+    pub fn write(self: HaveNoParentMessage, writer: *std.Io.Writer) !void {
+        try writer.writeByte(@intFromBool(self.no_parent));
+    }
+};
+
 /// Represents server code 23, a message to acknowledge receipt of a user direct message.
 pub const MessageAckedMessage = struct {
     message_id: u32,
@@ -141,6 +151,7 @@ pub const Response = union(enum(u32)) {
     privilegedUsers: PrivilegedUsersResponse = 69,
     parentMinSpeed: ParentMinSpeedResponse = 83,
     parentSpeedRatio: ParentSpeedRatioResponse = 84,
+    possibleParents: PossibleParentsResponse = 102,
     wishlistSearch: WishlistSearchResponse = 104,
     excludedSearchPhrases: ExcludedSearchPhrasesResponse = 160,
 
@@ -409,6 +420,56 @@ pub const ParentSpeedRatioResponse = struct {
     }
 };
 
+/// Represents a PossibleParentsRatio response.
+pub const PossibleParentsResponse = struct {
+    parents: []Parent,
+
+    pub fn deinit(self: *PossibleParentsResponse, allocator: std.mem.Allocator) void {
+        for (self.parents) |*parent| parent.deinit(allocator);
+        allocator.free(self.parents);
+    }
+
+    pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !PossibleParentsResponse {
+        const parent_count = try reader.takeInt(u32, .little);
+        const parents = try allocator.alloc(Parent, parent_count);
+        var parents_parsed: usize = 0;
+        errdefer {
+            for (parents[0..parents_parsed]) |*parent| {
+                parent.deinit(allocator);
+            }
+            allocator.free(parents);
+        }
+
+        for (parents) |*parent| {
+            parent.* = try Parent.parse(reader, allocator);
+            parents_parsed += 1;
+        }
+
+        return PossibleParentsResponse{
+            .parents = parents,
+        };
+    }
+};
+
+/// Represents a parent on the Soulseek network.
+pub const Parent = struct {
+    username: []const u8,
+    ip: [4]u8,
+    port: u32,
+
+    pub fn deinit(self: *Parent, allocator: std.mem.Allocator) void {
+        allocator.free(self.username);
+    }
+
+    pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !Parent {
+        return Parent{
+            .username = try readString(allocator, reader),
+            .ip = try readIP(reader),
+            .port = try reader.takeInt(u32, .little),
+        };
+    }
+};
+
 /// Represents a WishlistSearch response.
 pub const WishlistSearchResponse = struct {
     interval: u32,
@@ -453,7 +514,126 @@ pub const ExcludedSearchPhrasesResponse = struct {
     }
 };
 
-/// Represents a Soulseek peer init message. These are generic. Enum value corresponds to the relevant message code.
+/// Represents a Soulseek distributed message. These are generic. Enum value corresponds to the relevant message code.
+pub const DistributedMessage = union(enum(u8)) {
+    search: SearchMessage = 3,
+    branchLevel: BranchLevelMessage = 4,
+    branchRoot: BranchRootMessage = 5,
+
+    pub fn deinit(self: *DistributedMessage, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |*resp| resp.deinit(allocator),
+        }
+    }
+
+    // Returns the relevant message code based on the enum value.
+    pub fn code(self: DistributedMessage) u8 {
+        return @intFromEnum(self);
+    }
+
+    // Returns the size of the underlying message. Returns an error if message is larger than u32 max value.
+    pub fn size(self: DistributedMessage) !u32 {
+        // get size of underlying message
+        const msg_size = switch (self) {
+            inline else => |msg| calcSize(msg),
+        };
+
+        // check for overflow
+        if (msg_size > std.math.maxInt(u32)) {
+            return error.MessageTooLarge;
+        }
+
+        return @intCast(msg_size);
+    }
+
+    // Writes a message.
+    pub fn write(self: DistributedMessage, writer: *std.Io.Writer) !void {
+        switch (self) {
+            inline else => |msg| {
+                try writer.writeInt(u32, try self.size() + 1, .little);
+                try writer.writeInt(u8, self.code(), .little);
+                try msg.write(writer);
+            },
+        }
+    }
+};
+
+/// Represents distributed code 3, a message to propagate a search.
+pub const SearchMessage = struct {
+    username: []const u8,
+    token: u32,
+    query: []const u8,
+
+    pub fn deinit(self: *SearchMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.username);
+        allocator.free(self.query);
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !SearchMessage {
+        _ = try reader.takeInt(u32, .little);
+        const username = try readString(allocator, reader);
+        const token = try reader.takeInt(u32, .little);
+        const query = try readString(allocator, reader);
+
+        return SearchMessage{
+            .username = username,
+            .token = token,
+            .query = query,
+        };
+    }
+
+    pub fn write(self: SearchMessage, writer: *std.Io.Writer) !void {
+        try writer.writeInt(u32, 0, .little); // unknown
+        try writeString(self.username, writer);
+        try writer.writeInt(u32, self.token, .little);
+        try writeString(self.query, writer);
+    }
+};
+
+/// Represents distributed code 4, a message to inform branch depth.
+pub const BranchLevelMessage = struct {
+    level: i32,
+
+    pub fn deinit(self: *BranchLevelMessage, allocator: std.mem.Allocator) void {
+        _ = self;
+        _ = allocator;
+    }
+
+    pub fn parse(reader: *std.Io.Reader) !BranchLevelMessage {
+        const level = try reader.takeInt(i32, .little);
+
+        return BranchLevelMessage{
+            .level = level,
+        };
+    }
+
+    pub fn write(self: TransferRequestMessage, writer: *std.Io.Writer) !void {
+        try writer.writeInt(i32, self.level, .little);
+    }
+};
+
+/// Represents distributed code 5, a message to inform branch root.
+pub const BranchRootMessage = struct {
+    root: []const u8,
+
+    pub fn deinit(self: *BranchRootMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.root);
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !BranchRootMessage {
+        const root = try readString(allocator, reader);
+
+        return BranchRootMessage{
+            .root = root,
+        };
+    }
+
+    pub fn write(self: BranchRootMessage, writer: *std.Io.Writer) !void {
+        try writeString(self.root, writer);
+    }
+};
+
+/// Represents a Soulseek peer message. These are generic. Enum value corresponds to the relevant message code.
 pub const PeerMessage = union(enum(u32)) {
     getSharedFileList: EmptyMessage = 4,
     sharedFileList: SharedFileListMessage = 5,

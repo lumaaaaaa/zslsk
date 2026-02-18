@@ -19,11 +19,13 @@ pub const SearchChannel = struct {
 pub const Client = struct {
     allocator: std.mem.Allocator,
     connection_state: std.atomic.Value(ConnectionState) = std.atomic.Value(ConnectionState).init(.disconnected), // connection state
-    socket: ?zio.net.Stream, // socket connection to centralized server
-    p2p_server: ?zio.net.Server, // server listening for p2p connections
+    socket: ?zio.net.Stream = null, // socket connection to centralized server
+    p2p_server: ?zio.net.Server = null, // server listening for p2p connections
     peers: std.StringHashMap(*PeerConnection), // established peer connections
     peers_mutex: std.Thread.Mutex = .{},
-    own_username: ?[]const u8,
+    distributed_connections: std.StringHashMap(*DistributedConnection), // establish distributed connections
+    distributed_mutex: std.Thread.Mutex = .{},
+    own_username: ?[]const u8 = null,
     connected_peer_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     // group for peer task execution
@@ -41,10 +43,8 @@ pub const Client = struct {
     pub fn init(allocator: std.mem.Allocator) !Client {
         return .{
             .allocator = allocator,
-            .socket = null,
-            .p2p_server = null,
             .peers = .init(allocator),
-            .own_username = null,
+            .distributed_connections = .init(allocator),
             .get_peer_address_channels = .init(allocator),
             .search_result_channels = .init(allocator),
         };
@@ -62,6 +62,7 @@ pub const Client = struct {
         self.search_result_channels.deinit();
 
         self.peers.deinit();
+        self.distributed_connections.deinit();
     }
 
     pub fn disconnect(self: *Client, rt: *zio.Runtime) void {
@@ -128,6 +129,12 @@ pub const Client = struct {
         } else {
             std.log.debug("Login successful. {s}", .{login_response.login.greeting.?});
         }
+
+        // tell the server we're an orphan
+        const have_no_parent_msg = messages.HaveNoParentMessage{
+            .no_parent = true,
+        };
+        try self.sendMessage(rt, .{ .haveNoParent = have_no_parent_msg });
 
         // we're connected!
         self.connection_state.store(.connected, .seq_cst);
@@ -363,9 +370,77 @@ pub const Client = struct {
                 .privilegedUsers => |resp| std.log.debug("\tPrivileged user count: {d}", .{resp.users.len}), // just print for now
                 .parentMinSpeed => |resp| std.log.debug("\tMinimum upload speed to become parent: {d}", .{resp.speed}), // just print for now
                 .parentSpeedRatio => |resp| std.log.debug("\tParent speed ratio: {d}", .{resp.ratio}), // just print for now
+                .possibleParents => |resp| {
+                    std.log.debug("\tReceived a list of {d} possible parents", .{resp.parents.len});
+                    should_deinit = false;
+
+                    self.peer_group.spawn(rt, handlePossibleParents, .{ self, rt, resp }) catch |err| {
+                        std.log.err("Could not spawn thread to handle PossibleParent message: {}", .{err});
+                    };
+                },
                 .wishlistSearch => |resp| std.log.debug("\tWishlist search interval: {d} seconds", .{resp.interval}), // just print for now
                 .excludedSearchPhrases => |resp| std.log.debug("\tExcluded search phrase count: {d}", .{resp.phrases.len}), // TODO: store these phrases, search requests should exclude paths containing these strings
             }
+        }
+    }
+
+    // Message handler for PossibleParents, establishes a distributed connection to a parent.
+    fn handlePossibleParents(self: *Client, rt: *zio.Runtime, resp: messages.PossibleParentsResponse) void {
+        var msg = resp;
+        defer msg.deinit(self.allocator);
+
+        // attempt distributed connections until one succeeds
+        for (msg.parents) |parent| {
+            // check port validity
+            const port = std.math.cast(u16, parent.port) orelse continue;
+            // get distributed connection
+            self.distributed_mutex.lock();
+            const distributed_gop = self.distributed_connections.getOrPut(parent.username) catch |err| {
+                std.log.err("Error getting distributed connection: {}", .{err});
+                return;
+            };
+            if (distributed_gop.found_existing) {
+                // distributed connection with username exists
+                self.distributed_mutex.unlock();
+                return;
+            }
+
+            // new distributed connection
+            const distributed_conn = DistributedConnection.init(self.allocator, parent.username, self.own_username.?, 0) catch |err| {
+                std.log.err("Error initializing distributed connection: {}", .{err});
+                _ = self.distributed_connections.remove(parent.username);
+                self.distributed_mutex.unlock();
+                return;
+            };
+
+            // update hashmap ptrs before releasing lock
+            distributed_gop.key_ptr.* = distributed_conn.username; // update key to distributed connection owned memory
+            distributed_gop.value_ptr.* = distributed_conn;
+            self.distributed_mutex.unlock();
+
+            // attempt connection
+            distributed_conn.connect(rt, parent.ip, port) catch |err| {
+                // cancellations and timeouts are normal behavior, no need to print anything
+                // honestly, this is debug log level for now since connection errors are common, not worth attention
+                if (err != error.Canceled and err != error.Timeout) {
+                    std.log.debug("Error connecting to distributed peer: {}", .{err});
+                }
+
+                self.distributed_mutex.lock();
+                _ = self.distributed_connections.remove(parent.username);
+                self.distributed_mutex.unlock();
+                distributed_conn.deinit(rt);
+                self.allocator.destroy(distributed_conn);
+                continue;
+            };
+
+            // spawn distributed connection and run
+            self.spawnDistributedPeer(rt, distributed_conn, true) catch |err| {
+                std.log.err("Error spawning & running distributed peer: {}", .{err});
+                continue;
+            };
+
+            return;
         }
     }
 
@@ -540,6 +615,24 @@ pub const Client = struct {
         self.allocator.destroy(peer);
     }
 
+    // Spawns distributed peer and begins running.
+    fn spawnDistributedPeer(self: *Client, rt: *zio.Runtime, peer: *DistributedConnection, we_initiated: bool) !void {
+        try self.peer_group.spawn(rt, runDistributedPeer, .{ self, rt, peer, we_initiated });
+    }
+
+    // Runs the distributed peer.
+    fn runDistributedPeer(self: *Client, rt: *zio.Runtime, peer: *DistributedConnection, we_initiated: bool) void {
+        peer.run(rt, we_initiated);
+
+        // cleanup
+        self.distributed_mutex.lock();
+        _ = self.distributed_connections.remove(peer.username);
+        std.log.debug("Distributed peer '{s}' disconnected.", .{peer.username});
+        self.distributed_mutex.unlock();
+        peer.deinit(rt);
+        self.allocator.destroy(peer);
+    }
+
     // Sends a message to the connected server.
     fn sendMessage(self: *Client, rt: *zio.Runtime, msg: messages.Message) !void {
         // TODO: handle error when socket is closed
@@ -572,6 +665,7 @@ pub const Client = struct {
             69 => .{ .privilegedUsers = try messages.PrivilegedUsersResponse.parse(&reader.interface, self.allocator) },
             83 => .{ .parentMinSpeed = try messages.ParentMinSpeedResponse.parse(&reader.interface) },
             84 => .{ .parentSpeedRatio = try messages.ParentSpeedRatioResponse.parse(&reader.interface) },
+            102 => .{ .possibleParents = try messages.PossibleParentsResponse.parse(&reader.interface, self.allocator) },
             104 => .{ .wishlistSearch = try messages.WishlistSearchResponse.parse(&reader.interface) },
             160 => .{ .excludedSearchPhrases = try messages.ExcludedSearchPhrasesResponse.parse(&reader.interface, self.allocator) },
             else => {
@@ -588,11 +682,171 @@ pub const Client = struct {
     }
 };
 
+pub const DistributedConnection = struct {
+    allocator: std.mem.Allocator,
+    username: []const u8,
+    own_username: []const u8,
+    token: u32,
+    socket: ?zio.net.Stream = null,
+
+    // connection state
+    connection_state: std.atomic.Value(ConnectionState) = std.atomic.Value(ConnectionState).init(.disconnected),
+
+    pub fn init(allocator: std.mem.Allocator, username: []const u8, own_username: []const u8, token: u32) !*DistributedConnection {
+        const dc = try allocator.create(DistributedConnection);
+        dc.* = .{
+            .allocator = allocator,
+            .username = try allocator.dupe(u8, username),
+            .own_username = try allocator.dupe(u8, own_username),
+            .token = token,
+        };
+        return dc;
+    }
+
+    pub fn deinit(self: *DistributedConnection, rt: *zio.Runtime) void {
+        self.allocator.free(self.username);
+        self.allocator.free(self.own_username);
+        if (self.socket) |s| s.close(rt);
+    }
+
+    pub fn connect(self: *DistributedConnection, rt: *zio.Runtime, ip: [4]u8, port: u16) !void {
+        std.log.debug("Establishing distributed connection with {s} @ {d}.{d}.{d}.{d}:{d}...", .{
+            self.username,
+            ip[0],
+            ip[1],
+            ip[2],
+            ip[3],
+            port,
+        });
+
+        // connect to host
+        const address = zio.net.IpAddress.initIp4(ip, port);
+        self.socket = try zio.net.tcpConnectToAddress(rt, address, .{
+            .timeout = .{ .duration = .fromSeconds(20) },
+        });
+        std.log.debug("Connection established.", .{});
+    }
+
+    // Self-contained distributed connection logic.
+    pub fn run(self: *DistributedConnection, rt: *zio.Runtime, we_initiated: bool) void {
+        // reader for socket
+        var read_buf: [4096]u8 = undefined;
+        var reader = self.socket.?.reader(rt, &read_buf);
+
+        // send correct handshake
+        if (we_initiated) {
+            const msg = messages.PeerInit{
+                .username = self.own_username,
+                .type = @tagName(types.ConnectionType.D),
+                .token = 0,
+            };
+
+            self.sendPeerInitMessage(rt, .{ .peerInit = msg }) catch |err| {
+                std.log.err("Failed to send PeerInit to {s}: {}", .{ self.username, err });
+                return;
+            };
+        } else {
+            const msg = messages.PierceFireWall{
+                .token = self.token,
+            };
+
+            self.sendPeerInitMessage(rt, .{ .pierceFireWall = msg }) catch |err| {
+                std.log.err("Failed to send PierceFirewall to {s}: {}", .{ self.username, err });
+                return;
+            };
+        }
+
+        // handshake done, good to go
+        std.log.debug("Handshake complete with {s}, beginning read loop", .{self.username});
+        self.connection_state.store(.connected, .seq_cst);
+
+        // begin read loop
+        self.readLoop(rt, &reader);
+    }
+
+    // Distributed connection message parser.
+    fn readResponse(self: *DistributedConnection, reader: *zio.net.Stream.Reader) !messages.DistributedMessage {
+        // TODO: handle error when socket is closed
+
+        // parse message header
+        const payload_len = try reader.interface.takeInt(u32, .little);
+        const message_code = try reader.interface.takeInt(u8, .little);
+
+        // handoff to relevant parser
+        return switch (message_code) {
+            3 => .{ .search = try messages.SearchMessage.parse(self.allocator, &reader.interface) },
+            4 => .{ .branchLevel = try messages.BranchLevelMessage.parse(&reader.interface) },
+            5 => .{ .branchRoot = try messages.BranchRootMessage.parse(self.allocator, &reader.interface) },
+            else => {
+                std.log.warn("Distributed connection {s} readResponse dropped an unknown message. code: {d}, length: {d}", .{ self.username, message_code, payload_len });
+
+                // discard
+                const remaining: usize = payload_len - 1;
+                try reader.interface.discardAll(remaining);
+
+                std.log.debug("Discarded {d} bytes from TCP stream", .{remaining});
+                return error.UnknownMessage;
+            },
+        };
+    }
+
+    // Distributed connection read loop.
+    fn readLoop(self: *DistributedConnection, rt: *zio.Runtime, reader: *zio.net.Stream.Reader) void {
+        _ = rt;
+        while (self.connection_state.load(.seq_cst) == .connected) {
+            var message = self.readResponse(reader) catch |err| {
+                if (err == error.EndOfStream or err == error.ReadFailed) {
+                    self.connection_state.store(.disconnected, .seq_cst);
+                    return;
+                }
+                std.log.err("Error encountered in peer readResponse: {}", .{err});
+                continue;
+            };
+
+            // deinit message if it isn't returned
+            const should_deinit = true;
+            defer if (should_deinit) message.deinit(self.allocator);
+
+            // handle async message types
+            std.log.debug("== Received DistributedMessage: {s} (code: {d}) ==", .{ @tagName(message), message.code() });
+            switch (message) {
+                .search => |msg| std.log.debug("\tSearch: user {s} is looking for '{s}'", .{ msg.username, msg.query }),
+                .branchLevel => |msg| std.log.debug("\tDistributed peer {s} has branch level {d}", .{ self.username, msg.level }),
+                .branchRoot => |msg| std.log.debug("\tDistributed peer {s} has branch root {s}", .{ self.username, msg.root }),
+            }
+        }
+    }
+
+    // Sends one of the PeerInit messages: PierceFireWall or PeerInit.
+    fn sendPeerInitMessage(self: *DistributedConnection, rt: *zio.Runtime, msg: messages.PeerInitMessage) !void {
+        // TODO: handle error when socket is closed
+
+        // create buffered writer
+        var write_buf: [4096]u8 = undefined;
+        var writer = self.socket.?.writer(rt, &write_buf);
+        const writer_interface = &writer.interface;
+        try msg.write(writer_interface);
+        try writer_interface.flush();
+    }
+
+    // Sends a DistributedMessage to the peer.
+    fn sendDistributedMessage(self: *DistributedConnection, rt: *zio.Runtime, msg: messages.DistributedMessage) !void {
+        // TODO: handle error when socket is closed
+
+        // create buffered writer
+        var write_buf: [4096]u8 = undefined;
+        var writer = self.socket.?.writer(rt, &write_buf);
+        const writer_interface = &writer.interface;
+        try msg.write(writer_interface);
+        try writer_interface.flush();
+    }
+};
+
 pub const FileConnection = struct {
     allocator: std.mem.Allocator,
     username: []const u8,
     token: u32,
-    socket: ?zio.net.Stream,
+    socket: ?zio.net.Stream = null,
 
     pub fn init(allocator: std.mem.Allocator, username: []const u8, token: u32) !*FileConnection {
         const fc = try allocator.create(FileConnection);
@@ -600,7 +854,6 @@ pub const FileConnection = struct {
             .allocator = allocator,
             .username = try allocator.dupe(u8, username),
             .token = token,
-            .socket = null,
         };
         return fc;
     }
