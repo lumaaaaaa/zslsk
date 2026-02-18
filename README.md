@@ -6,6 +6,9 @@ It uses [zio](https://github.com/lalinsky/zio) under the hood for efficient asyn
 
 The library is under active development, and many features are currently missing.
 
+> [!CAUTION]
+> zslsk is currently not intended for use in production. There are likely vulnerabilities that exist in the codebase that may put your system at risk.
+
 ## Status
 
 - [x] Basic app (in `main.zig`) demonstrating use of library with following commands:
