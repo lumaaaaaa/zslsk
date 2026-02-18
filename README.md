@@ -2,7 +2,7 @@
 
 zslsk is a client-server library for the proprietary Soulseek protocol written in Zig.
 
-It uses [zio](https://github.com/lalinsky/zio) under for efficient asynchronous I/O.
+It uses [zio](https://github.com/lalinsky/zio) under the hood for efficient asynchronous I/O.
 
 The library is under active development, and many features are currently missing.
 
