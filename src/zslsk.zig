@@ -16,6 +16,17 @@ pub const SearchChannel = struct {
     buffer: []messages.FileSearchResponseMessage,
 };
 
+pub const DownloadChannel = struct {
+    size: u64,
+    channel: *zio.Channel(u8),
+    buffer: []u8,
+
+    pub fn deinit(self: *DownloadChannel, allocator: std.mem.Allocator) void {
+        allocator.free(self.buffer);
+        allocator.destroy(self.channel);
+    }
+};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     connection_state: std.atomic.Value(ConnectionState) = std.atomic.Value(ConnectionState).init(.disconnected), // connection state
@@ -183,7 +194,7 @@ pub const Client = struct {
         // zig new std.Io to access std.Io.random
         var threaded = std.Io.Threaded.init(self.allocator, .{
             .environ = .empty,
-        }); // HACK: short lived std.Io instance cause rt.io() panics :(
+        }); // HACK: short lived std.Io instance because rt.io() panics :(
         defer threaded.deinit();
         const io = threaded.ioBasic();
 
@@ -221,7 +232,7 @@ pub const Client = struct {
     }
 
     /// Requests a specified file from the peer with specified username.
-    pub fn downloadFile(self: *Client, rt: *zio.Runtime, username: []const u8, filepath: []const u8) ![]u8 {
+    pub fn downloadFile(self: *Client, rt: *zio.Runtime, username: []const u8, filepath: []const u8) !DownloadChannel {
         // get the peer
         const peer = try self.getOrCreatePeer(rt, username);
 
@@ -1082,7 +1093,7 @@ pub const PeerConnection = struct {
         return channel.receive(rt);
     }
 
-    pub fn queueDownload(self: *PeerConnection, rt: *zio.Runtime, filepath: []const u8) ![]u8 {
+    pub fn queueDownload(self: *PeerConnection, rt: *zio.Runtime, filepath: []const u8) !DownloadChannel {
         // wait for handshake
         while (self.connection_state.load(.seq_cst) != .connected) {
             try rt.sleep(.fromMilliseconds(1));
@@ -1141,12 +1152,13 @@ pub const PeerConnection = struct {
 
         // wait for file connection
         var file_conn = try file_channel.receive(rt);
-        defer file_conn.deinit(rt);
-        defer self.allocator.destroy(file_conn);
 
-        // reader for socket
-        var read_buf: [4096]u8 = undefined;
-        var reader = file_conn.socket.?.reader(rt, &read_buf);
+        // reader buf for socket
+        const read_buf = try self.allocator.create([4096]u8); // on heap
+        errdefer self.allocator.destroy(read_buf);
+
+        // temporary reader for handshake/init msgs
+        var reader = file_conn.socket.?.reader(rt, read_buf);
 
         // token determines how handshake goes. if nonzero, this was indirect
         if (file_conn.token == 0) {
@@ -1175,11 +1187,52 @@ pub const PeerConnection = struct {
         };
         try file_conn.sendFileMessage(rt, .{ .fileOffset = file_offset_msg });
 
-        // read full file
-        const data = try reader.interface.readAlloc(self.allocator, transfer_request_msg.size);
+        // create a channel for the downloaded bytes
+        const buf = try self.allocator.alloc(u8, transfer_request_msg.size);
+        errdefer self.allocator.free(buf);
+        const channel = try self.allocator.create(zio.Channel(u8));
+        errdefer self.allocator.destroy(channel);
+        channel.* = zio.Channel(u8).init(buf);
 
-        // return data to caller
-        return data;
+        // download task logic
+        const DownloadTask = struct {
+            fn run(runtime: *zio.Runtime, fconn: *FileConnection, allocator: std.mem.Allocator, rdr_buf: *[4096]u8, ch: *zio.Channel(u8), size: u64) void {
+                // cleanup the stuff we use
+                defer fconn.deinit(runtime);
+                defer allocator.destroy(fconn);
+                defer allocator.destroy(rdr_buf);
+                defer ch.close(.graceful);
+
+                // get reader in task
+                var rdr = fconn.socket.?.reader(runtime, rdr_buf);
+
+                // push bytes into channel one by one
+                var remaining = size;
+                while (remaining > 0) {
+                    const byte = rdr.interface.takeByte() catch |err| {
+                        std.log.err("Could not read from file connection: {}", .{err});
+                        ch.close(.immediate);
+                        return;
+                    };
+                    ch.trySend(byte) catch |err| {
+                        std.log.err("Could not send to channel: {}", .{err});
+                        return;
+                    };
+                    remaining -= 1;
+                }
+            }
+        };
+
+        // spawn task to feed channel
+        var handle = try rt.spawn(DownloadTask.run, .{ rt, file_conn, self.allocator, read_buf, channel, transfer_request_msg.size });
+        handle.detach(rt);
+
+        // return channel to caller
+        return DownloadChannel{
+            .size = transfer_request_msg.size,
+            .buffer = buf,
+            .channel = channel,
+        };
     }
 
     // Peer message parser.

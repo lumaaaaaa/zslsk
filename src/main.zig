@@ -6,6 +6,7 @@ const zio = @import("zio");
 const HOST: []const u8 = "server.slsknet.org";
 const PORT: u16 = 2242;
 const LISTEN_PORT: u16 = 22340;
+const DEFAULT_TERM_WIDTH: u16 = 80;
 
 const Command = enum {
     download, // downloads a target file from a target username (ex. download <username> <filename>)
@@ -84,11 +85,11 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                             continue;
                         }
 
-                        const data = client.downloadFile(rt, user, filepath) catch |err| {
-                            std.log.err("Could not download file: {}", .{err});
+                        var dl_channel = client.downloadFile(rt, user, filepath) catch |err| {
+                            std.log.err("Could not create download channel: {}", .{err});
                             continue;
                         };
-                        defer allocator.free(data);
+                        defer dl_channel.deinit(allocator);
 
                         // zig new std.Io to access std.Io.random
                         var threaded = std.Io.Threaded.init(allocator, .{
@@ -97,15 +98,57 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                         defer threaded.deinit();
                         const io = threaded.ioBasic();
 
+                        // create/open file for writing
                         const filename = std.fs.path.basenameWindows(filepath);
-                        const file = std.Io.Dir.cwd().createFile(io, filename, .{ .exclusive = true }) catch |err| {
+                        const file = std.Io.Dir.cwd().createFile(io, filename, .{ .truncate = true }) catch |err| {
                             std.log.err("Could not create file: {}", .{err});
                             continue;
                         };
 
-                        _ = file.writeStreamingAll(io, data) catch |err| {
-                            std.log.err("Could not write file: {}", .{err});
+                        // get file writer
+                        var write_buf: [4096]u8 = undefined;
+                        var writer = file.writer(io, &write_buf);
+
+                        // get terminal size for progress bar
+                        const term_width = getTerminalWidth() orelse DEFAULT_TERM_WIDTH;
+                        const bar_width = term_width - 12; // padding + borders + pct
+                        const progress_step = dl_channel.size / bar_width;
+
+                        // receive bytes from channel until closed
+                        var read: u64 = 0;
+                        while (read < dl_channel.size) {
+                            // attempt to receive a byte
+                            const byte = dl_channel.channel.receive(rt) catch |err| {
+                                std.log.err("Could not receive from download channel: {}", .{err});
+                                break;
+                            };
+
+                            read += 1;
+
+                            // flush write_buf when full or done
+                            writer.interface.writeByte(byte) catch |err| {
+                                std.log.err("Could not write to file: {}", .{err});
+                                break;
+                            };
+
+                            // print progress bar if there's a bar update
+                            if (read % progress_step == 0 or read == dl_channel.size) {
+                                const pct = (@as(f64, @floatFromInt(read)) / @as(f64, @floatFromInt(dl_channel.size))) * 100.0;
+                                const filled = (read * bar_width) / dl_channel.size;
+                                const vacant = bar_width - filled;
+
+                                // carriage return to move cursor to line start
+                                print(rt, "\r \u{2590}", .{});
+                                for (0..filled) |_| print(rt, "\u{2588}", .{});
+                                for (0..vacant) |_| print(rt, "\u{2591}", .{});
+                                print(rt, "\u{258C} {d:.1}% ", .{pct});
+                            }
+                        }
+                        writer.interface.flush() catch |err| {
+                            std.log.err("Could not flush file writer: {}", .{err});
+                            continue;
                         };
+                        print(rt, "\n", .{});
 
                         print(rt, "[info] file downloaded to './{s}'\n", .{filename});
                     },
@@ -231,4 +274,25 @@ pub fn readStdinLine(rt: *zio.Runtime, allocator: std.mem.Allocator) ![]const u8
 
     // return a copy
     return allocator.dupe(u8, line);
+}
+
+/// Helper function to get terminal size (POSIX).
+fn getTerminalWidth() ?u16 {
+    var winsize = std.posix.winsize{
+        .row = 0,
+        .col = 0,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+    const rv = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, @intFromPtr(&winsize));
+
+    if (rv == 0) {
+        if (winsize.row == 0 or winsize.col == 0) {
+            return null; // maybe not TTY, invalid result
+        }
+        return winsize.col;
+    }
+
+    // just return null if error, caller should default to some value
+    return null;
 }
