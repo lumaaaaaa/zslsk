@@ -1200,10 +1200,12 @@ pub const PeerConnection = struct {
         const DownloadTask = struct {
             fn run(runtime: *zio.Runtime, fconn: *FileConnection, allocator: std.mem.Allocator, rdr_buf: *[4096]u8, ch: *zio.Channel(u8), size: u64) void {
                 // cleanup the stuff we use
-                defer fconn.deinit(runtime);
-                defer allocator.destroy(fconn);
-                defer allocator.destroy(rdr_buf);
-                defer ch.close(.graceful);
+                defer {
+                    fconn.deinit(runtime);
+                    allocator.destroy(fconn);
+                    allocator.destroy(rdr_buf);
+                    ch.close(.graceful);
+                }
 
                 // get reader in task
                 var rdr = fconn.socket.?.reader(runtime, rdr_buf);
