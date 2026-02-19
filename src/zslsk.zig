@@ -20,8 +20,10 @@ pub const DownloadChannel = struct {
     size: u64,
     channel: *zio.Channel(u8),
     buffer: []u8,
+    handle: zio.JoinHandle(void),
 
-    pub fn deinit(self: *DownloadChannel, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *DownloadChannel, rt: *zio.Runtime, allocator: std.mem.Allocator) void {
+        self.handle.join(rt);
         allocator.free(self.buffer);
         allocator.destroy(self.channel);
     }
@@ -1224,14 +1226,14 @@ pub const PeerConnection = struct {
         };
 
         // spawn task to feed channel
-        var handle = try rt.spawn(DownloadTask.run, .{ rt, file_conn, self.allocator, read_buf, channel, transfer_request_msg.size });
-        handle.detach(rt);
+        const handle = try rt.spawn(DownloadTask.run, .{ rt, file_conn, self.allocator, read_buf, channel, transfer_request_msg.size });
 
         // return channel to caller
         return DownloadChannel{
             .size = transfer_request_msg.size,
             .buffer = buf,
             .channel = channel,
+            .handle = handle,
         };
     }
 

@@ -89,7 +89,7 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                             std.log.err("Could not create download channel: {}", .{err});
                             continue;
                         };
-                        defer dl_channel.deinit(allocator);
+                        defer dl_channel.deinit(rt, allocator);
 
                         // zig new std.Io to access std.Io.random
                         var threaded = std.Io.Threaded.init(allocator, .{
