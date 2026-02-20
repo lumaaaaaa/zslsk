@@ -1297,7 +1297,6 @@ pub const PeerConnection = struct {
             var message = self.readResponse(reader) catch |err| {
                 if (err == error.EndOfStream or err == error.ReadFailed) {
                     self.connection_state.store(.disconnected, .seq_cst);
-                    std.log.err("Error encountered in peer readResponse: {}", .{err});
                     return;
                 }
                 std.log.err("Error encountered in peer readResponse: {}", .{err});
