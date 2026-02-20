@@ -723,9 +723,9 @@ pub const SharedFileListMessage = struct {
         }
 
         // official clients read u32 0
-        _ = try decompressor.reader.takeByte();
+        _ = try decompressor.reader.takeInt(u32, .little);
 
-        const priv_dir_count = try decompressor.reader.takeInt(u32, .little);
+        const priv_dir_count = decompressor.reader.takeInt(u32, .little) catch 0;
         const private_directories = try allocator.alloc(SharedDirectory, priv_dir_count);
         errdefer allocator.free(private_directories);
         for (private_directories) |*dir| {
@@ -834,7 +834,7 @@ pub const FileSearchResponseMessage = struct {
         // official clients read u32 0
         _ = try decompressor.reader.takeInt(u32, .little);
 
-        const priv_file_count = try decompressor.reader.takeInt(u32, .little);
+        const priv_file_count = decompressor.reader.takeInt(u32, .little) catch 0;
         const private_files = try allocator.alloc(SharedFile, priv_file_count);
         var priv_files_parsed: usize = 0;
         errdefer {

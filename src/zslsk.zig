@@ -93,6 +93,24 @@ pub const Client = struct {
             channel.value_ptr.*.channel.close(.graceful);
         }
         self.search_mutex.unlock();
+
+        // close peer connections so their read loops exit
+        self.peers_mutex.lock();
+        var peer_iter = self.peers.iterator();
+        while (peer_iter.next()) |entry| {
+            entry.value_ptr.*.connection_state.store(.disconnected, .seq_cst);
+            if (entry.value_ptr.*.socket) |s| s.close(rt);
+        }
+        self.peers_mutex.unlock();
+
+        // close distributed connections too
+        self.distributed_mutex.lock();
+        var dist_iter = self.distributed_connections.iterator();
+        while (dist_iter.next()) |entry| {
+            entry.value_ptr.*.connection_state.store(.disconnected, .seq_cst);
+            if (entry.value_ptr.*.socket) |s| s.close(rt);
+        }
+        self.distributed_mutex.unlock();
     }
 
     /// Connects and authenticates with a Soulseek server. Begins the async runtime.
@@ -153,7 +171,8 @@ pub const Client = struct {
         self.connection_state.store(.connected, .seq_cst);
 
         // dispatch concurrent tasks
-        try self.peer_group.spawn(rt, p2pListenerTask, .{ self, rt, listen_port }); // p2p listener
+        _ = listen_port;
+        //try self.peer_group.spawn(rt, p2pListenerTask, .{ self, rt, listen_port }); // p2p listener
 
         // begin read loop
         self.readLoop(rt, &reader);
@@ -1278,6 +1297,7 @@ pub const PeerConnection = struct {
             var message = self.readResponse(reader) catch |err| {
                 if (err == error.EndOfStream or err == error.ReadFailed) {
                     self.connection_state.store(.disconnected, .seq_cst);
+                    std.log.err("Error encountered in peer readResponse: {}", .{err});
                     return;
                 }
                 std.log.err("Error encountered in peer readResponse: {}", .{err});
