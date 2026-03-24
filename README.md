@@ -11,6 +11,9 @@ The library is under active development, and many features are currently missing
 
 ## Status
 
+> [!WARNING]
+> zslsk is only confirmed to build with Zig version `0.16.0-dev.2459+37d14a4f3`. I know this is suboptimal, but [this issue](https://github.com/lumaaaaaa/zslsk/issues/24) explains what the situation is and track the status of it. The goal is to move to Zig 0.16.0 when it is released.
+
 - [x] Basic app (in `main.zig`) demonstrating use of library with following commands:
   - `download`
   - `filelist`
