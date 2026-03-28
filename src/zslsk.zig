@@ -40,12 +40,14 @@ pub const Client = struct {
     distributed_mutex: std.Thread.Mutex = .{},
     own_username: ?[]const u8 = null,
     connected_peer_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    user_info: types.UserInfoConfig = .{ .description = "hello from https://github.com/lumaaaaaa/zslsk", .picture = null },
 
     // group for peer task execution
     peer_group: zio.Group = .init,
 
     // oneshot channels for request-response, keyed by username for concurrency
     get_peer_address_channels: std.StringHashMap(*zio.Channel(messages.GetPeerAddressResponse)),
+    user_interests_channels: std.StringHashMap(*zio.Channel(messages.UserInterestsResponse)),
     waiters_mutex: std.Thread.Mutex = .{},
 
     // channels for streaming request-response
@@ -59,6 +61,7 @@ pub const Client = struct {
             .peers = .init(allocator),
             .distributed_connections = .init(allocator),
             .get_peer_address_channels = .init(allocator),
+            .user_interests_channels = .init(allocator),
             .search_result_channels = .init(allocator),
         };
     }
@@ -201,6 +204,32 @@ pub const Client = struct {
         return try conn.getUserInfo(rt);
     }
 
+    /// Gets user interests of the user with the specified username.
+    pub fn getUserInterests(self: *Client, rt: *zio.Runtime, username: []const u8) !messages.UserInterestsResponse {
+        // create oneshot channel for request-response
+        var one: [1]messages.UserInterestsResponse = undefined;
+        var channel = zio.Channel(messages.UserInterestsResponse).init(&one);
+        defer channel.close(.graceful);
+
+        // register
+        self.waiters_mutex.lock();
+        try self.user_interests_channels.put(username, &channel);
+        self.waiters_mutex.unlock();
+
+        // unregister on exit
+        defer {
+            self.waiters_mutex.lock();
+            _ = self.user_interests_channels.remove(username);
+            self.waiters_mutex.unlock();
+        }
+
+        // request peer address
+        try self.sendMessage(rt, .{ .userInterests = messages.UserInterestsMessage{ .username = username } });
+
+        // block until we receive a response
+        return channel.receive(rt);
+    }
+
     /// Gets shared file list of the user with the specified username.
     pub fn getSharedFileList(self: *Client, rt: *zio.Runtime, username: []const u8) !messages.SharedFileListMessage {
         // get the peer
@@ -273,6 +302,7 @@ pub const Client = struct {
         try self.sendMessage(rt, .{ .messageUser = message_user_msg });
     }
 
+    /// Requests the IP address and listening port for a specified username from the server.
     pub fn getPeerAddress(self: *Client, rt: *zio.Runtime, username: []const u8) !messages.GetPeerAddressResponse {
         // create oneshot channel for request-response
         var one: [1]messages.GetPeerAddressResponse = undefined;
@@ -397,6 +427,17 @@ pub const Client = struct {
                     };
 
                     std.log.debug("Acknowledged private chat receipt", .{});
+                },
+                .userInterests => |resp| {
+                    std.log.debug("\tReceived {s}'s interests", .{resp.username});
+                    should_deinit = false;
+
+                    // send response in corresponding user interests oneshot channel
+                    if (self.user_interests_channels.get(resp.username)) |channel| {
+                        channel.send(rt, resp) catch |err| {
+                            std.log.err("Could not send UserInterestsResponse in oneshot channel: {}", .{err});
+                        };
+                    }
                 },
                 .roomList => |resp| std.log.debug("\tRoom counts: {d} total, {d} owned private, {d} unowned private, {d} operated private", .{ resp.rooms.len, resp.owned_private_rooms.len, resp.unowned_private_rooms.len, resp.operated_private_rooms.len }),
                 .privilegedUsers => |resp| std.log.debug("\tPrivileged user count: {d}", .{resp.users.len}), // just print for now
@@ -693,6 +734,7 @@ pub const Client = struct {
             3 => .{ .getPeerAddress = try messages.GetPeerAddressResponse.parse(&reader.interface, self.allocator) },
             18 => .{ .connectToPeer = try messages.ConnectToPeerResponse.parse(&reader.interface, self.allocator) },
             22 => .{ .messageUser = try messages.MessageUserResponse.parse(&reader.interface, self.allocator) },
+            57 => .{ .userInterests = try messages.UserInterestsResponse.parse(&reader.interface, self.allocator) },
             64 => .{ .roomList = try messages.RoomListResponse.parse(&reader.interface, self.allocator) },
             69 => .{ .privilegedUsers = try messages.PrivilegedUsersResponse.parse(&reader.interface, self.allocator) },
             83 => .{ .parentMinSpeed = try messages.ParentMinSpeedResponse.parse(&reader.interface) },
@@ -1377,8 +1419,8 @@ pub const PeerConnection = struct {
                     std.log.debug("\t{s} requests our user info", .{self.username});
 
                     const msg = messages.UserInfoMessage{
-                        .description = "hello from zslsk",
-                        .picture = null,
+                        .description = self.client.user_info.description,
+                        .picture = self.client.user_info.picture,
                         .queue_size = 0,
                         .slots_free = true,
                         .total_upload = 420,

@@ -10,6 +10,7 @@ pub const Message = union(enum(u32)) {
     messageUser: MessageUserMessage = 22,
     messageAcked: MessageAckedMessage = 23,
     fileSearch: FileSearchMessage = 26,
+    userInterests: UserInterestsMessage = 57,
     haveNoParent: HaveNoParentMessage = 71,
     uploadSpeed: UploadSpeedMessage = 121,
 
@@ -114,6 +115,15 @@ pub const FileSearchMessage = struct {
     }
 };
 
+/// Represents server code 57, a message to request a target user's likes/dislikes.
+pub const UserInterestsMessage = struct {
+    username: []const u8,
+
+    pub fn write(self: UserInterestsMessage, writer: *std.Io.Writer) !void {
+        try writeString(self.username, writer);
+    }
+};
+
 /// Represents server code 71, a message to tell the server if we have no parent.
 pub const HaveNoParentMessage = struct {
     no_parent: bool,
@@ -147,6 +157,7 @@ pub const Response = union(enum(u32)) {
     getPeerAddress: GetPeerAddressResponse = 3,
     connectToPeer: ConnectToPeerResponse = 18,
     messageUser: MessageUserResponse = 22,
+    userInterests: UserInterestsResponse = 57,
     roomList: RoomListResponse = 64,
     privilegedUsers: PrivilegedUsersResponse = 69,
     parentMinSpeed: ParentMinSpeedResponse = 83,
@@ -288,6 +299,60 @@ pub const MessageUserResponse = struct {
             .username = try readString(allocator, reader),
             .message = try readString(allocator, reader),
             .new_message = (try reader.takeByte() == 1),
+        };
+    }
+};
+
+/// Represents a UserInterests response.
+pub const UserInterestsResponse = struct {
+    username: []const u8,
+    likes: [][]const u8,
+    dislikes: [][]const u8,
+
+    pub fn deinit(self: *UserInterestsResponse, allocator: std.mem.Allocator) void {
+        allocator.free(self.username);
+        for (self.likes) |like| allocator.free(like);
+        allocator.free(self.likes);
+        for (self.dislikes) |dislike| allocator.free(dislike);
+        allocator.free(self.dislikes);
+    }
+
+    pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !UserInterestsResponse {
+        const username = try readString(allocator, reader);
+        errdefer allocator.free(username);
+
+        const like_count = try reader.takeInt(u32, .little);
+        const likes = try allocator.alloc([]const u8, like_count);
+        var likes_parsed: usize = 0;
+        errdefer {
+            for (likes[0..likes_parsed]) |like| {
+                allocator.free(like);
+            }
+            allocator.free(likes);
+        }
+        for (likes) |*like| {
+            like.* = try readString(allocator, reader);
+            likes_parsed += 1;
+        }
+
+        const dislike_count = try reader.takeInt(u32, .little);
+        const dislikes = try allocator.alloc([]const u8, dislike_count);
+        var dislikes_parsed: usize = 0;
+        errdefer {
+            for (dislikes[0..dislikes_parsed]) |dislike| {
+                allocator.free(dislike);
+            }
+            allocator.free(dislikes);
+        }
+        for (dislikes) |*dislike| {
+            dislike.* = try readString(allocator, reader);
+            dislikes_parsed += 1;
+        }
+
+        return UserInterestsResponse{
+            .username = username,
+            .likes = likes,
+            .dislikes = dislikes,
         };
     }
 };

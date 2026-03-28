@@ -214,7 +214,23 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                         };
                         defer user_info.deinit(allocator);
 
+                        var user_interests = client.getUserInterests(rt, user) catch |err| {
+                            std.log.err("Likely could not connect to user. error: {}", .{err});
+                            continue;
+                        };
+                        defer user_interests.deinit(allocator);
+
                         print(rt, "{s}: {s}\n", .{ user, user_info.description });
+                        print(rt, "  likes: [ ", .{});
+                        for (user_interests.likes) |like| {
+                            print(rt, "{s} ", .{like});
+                        }
+                        print(rt, "]\n", .{});
+                        print(rt, "  dislikes: [ ", .{});
+                        for (user_interests.dislikes) |dislike| {
+                            print(rt, "{s} ", .{dislike});
+                        }
+                        print(rt, "]\n", .{});
                     },
                     Command.exit => {
                         client.disconnect(rt);

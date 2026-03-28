@@ -12,3 +12,9 @@ pub const ConnectionType = enum {
     F, // file transfer
     D, // distributed network
 };
+
+/// Structure representing a client's configurable user info to share with peers.
+pub const UserInfoConfig = struct {
+    description: []const u8, // a biography essentially
+    picture: ?[]const u8, // an optional profile picture
+};

@@ -30,6 +30,7 @@ The library is under active development, and many features are currently missing
   - `MessageUser`
   - `MessageAcked`
   - `FileSearch`
+  - `UserInterests`
   - `RoomList`
   - `PrivilegedUsers`
   - `ParentMinSpeed`
