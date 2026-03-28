@@ -1085,6 +1085,7 @@ pub const UserInfoMessage = struct {
         everyone = 1,
         users_in_list = 2,
         permitted_users = 3,
+        _,
     };
 
     pub fn deinit(self: *UserInfoMessage, allocator: std.mem.Allocator) void {
@@ -1094,17 +1095,23 @@ pub const UserInfoMessage = struct {
 
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader, start_seek: usize, payload_len: u32) !UserInfoMessage {
         const description = try readString(allocator, reader);
+        errdefer allocator.free(description);
         const has_picture = (try reader.takeByte() == 1);
         var picture: ?[]const u8 = null;
         if (has_picture) {
             picture = try readString(allocator, reader);
         }
+        errdefer if (picture) |p| allocator.free(p);
         const total_upload = try reader.takeInt(u32, .little);
         const queue_size = try reader.takeInt(u32, .little);
         const slots_free = (try reader.takeByte() == 1);
         var upload_permitted = UploadPermissions.everyone; // default to everyone
         if (reader.seek - start_seek < payload_len) {
             upload_permitted = @enumFromInt(try reader.takeInt(u32, .little));
+            switch (upload_permitted) {
+                .no_one, .everyone, .users_in_list, .permitted_users => {},
+                _ => return error.UnknownUploadPermissions, // received an invalid value
+            }
         }
 
         return UserInfoMessage{
