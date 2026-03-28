@@ -1148,8 +1148,13 @@ pub const TransferRequestMessage = struct {
 
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !TransferRequestMessage {
         const direction: TransferDirection = @enumFromInt(try reader.takeInt(u32, .little));
+        switch (direction) {
+            .downloadFromPeer, .uploadToPeer => {},
+            _ => return error.UnknownTransferDirection, // received an invalid value
+        }
         const token = try reader.takeInt(u32, .little);
         const filename = try readString(allocator, reader);
+        errdefer allocator.free(filename);
         const size = if (direction == .uploadToPeer) try reader.takeInt(u64, .little) else 0;
 
         return TransferRequestMessage{
@@ -1215,6 +1220,7 @@ pub const TransferResponseMessage = struct {
 const TransferDirection = enum(u32) {
     downloadFromPeer = 0,
     uploadToPeer = 1,
+    _,
 };
 
 /// Represents peer code 43, a message to queue an upload.
