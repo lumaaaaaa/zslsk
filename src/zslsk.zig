@@ -376,11 +376,16 @@ pub const Client = struct {
         var reader = stream.reader(rt, &read_buf);
 
         // parse message header
-        _ = reader.interface.takeInt(u32, .little) catch |err| { // TODO: will probably need to store this and use it for validation
+        const payload_len = reader.interface.takeInt(u32, .little) catch |err| { // TODO: will probably need to store this and use it for validation
             std.log.err("Error reading payload length of initial message from incoming connection: {}", .{err});
             stream.close(rt);
             return;
         };
+        if (payload_len < 1) {
+            std.log.err("Invalid handshake message received on P2P listener. Payload length has no space for message code.", .{});
+            stream.close(rt);
+            return;
+        }
         const message_code = reader.interface.takeInt(u8, .little) catch |err| {
             std.log.err("Error reading message code of initial message from incoming connection: {}", .{err});
             stream.close(rt);
@@ -869,6 +874,7 @@ pub const Client = struct {
 
         // parse message header
         const payload_len = try reader.interface.takeInt(u32, .little);
+        if (payload_len < 4) return error.InvalidMessage;
         const message_code = try reader.interface.takeInt(u32, .little);
 
         // handoff to relevant parser
@@ -987,6 +993,7 @@ pub const DistributedConnection = struct {
 
         // parse message header
         const payload_len = try reader.interface.takeInt(u32, .little);
+        if (payload_len < 1) return error.InvalidMessage;
         const message_code = try reader.interface.takeInt(u8, .little);
 
         // handoff to relevant parser
@@ -1457,6 +1464,7 @@ pub const PeerConnection = struct {
 
         // parse message header
         const payload_len = try reader.interface.takeInt(u32, .little);
+        if (payload_len < 4) return error.InvalidMessage;
         const start_seek = reader.interface.seek; // current_seek - start_seek < payload_len, keep parsing
         const message_code = try reader.interface.takeInt(u32, .little);
 
