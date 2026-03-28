@@ -174,8 +174,7 @@ pub const Client = struct {
         self.connection_state.store(.connected, .seq_cst);
 
         // dispatch concurrent tasks
-        _ = listen_port;
-        //try self.peer_group.spawn(rt, p2pListenerTask, .{ self, rt, listen_port }); // p2p listener
+        try self.peer_group.spawn(rt, p2pListenerTask, .{ self, rt, listen_port }); // p2p listener
 
         // begin read loop
         self.readLoop(rt, &reader);
@@ -364,8 +363,110 @@ pub const Client = struct {
             errdefer stream.close(rt);
 
             std.log.debug("Incoming P2P connection from {f}", .{stream.socket.address});
+            self.peer_group.spawn(rt, handleIncomingPeer, .{ self, rt, stream }) catch |err| {
+                std.log.err("Could not spawn thread to handle incoming P2P connection: {}", .{err});
+            };
+        }
+    }
+
+    // Handles in incoming P2P connection.
+    fn handleIncomingPeer(self: *Client, rt: *zio.Runtime, stream: zio.net.Stream) void {
+        // initialize socket reader and writer
+        var read_buf: [4096]u8 = undefined;
+        var reader = stream.reader(rt, &read_buf);
+
+        // parse message header
+        _ = reader.interface.takeInt(u32, .little) catch |err| { // TODO: will probably need to store this and use it for validation
+            std.log.err("Error reading payload length of initial message from incoming connection: {}", .{err});
             stream.close(rt);
-            //try peer_group.spawn(rt, handleIncomingPeer, .{ self, rt, stream });
+            return;
+        };
+        const message_code = reader.interface.takeInt(u8, .little) catch |err| {
+            std.log.err("Error reading message code of initial message from incoming connection: {}", .{err});
+            stream.close(rt);
+            return;
+        };
+
+        // message must be PeerInit
+        if (message_code != 1) {
+            std.log.err("A user attempted to start an incoming connection with an unexpected message.", .{});
+            stream.close(rt);
+            return;
+        }
+
+        // read incoming PeerInit to get username of connecting peer
+        var peer_init_msg = messages.PeerInit.parse(self.allocator, &reader.interface) catch |err| {
+            std.log.err("Error reading PeerInit message from incoming connection: {}", .{err});
+            stream.close(rt);
+            return;
+        };
+        defer peer_init_msg.deinit(self.allocator);
+
+        std.log.debug("Incoming direct connection from user '{s}'", .{peer_init_msg.username});
+
+        // get peer
+        self.peers_mutex.lock();
+        const peer_gop = self.peers.getOrPut(peer_init_msg.username) catch |err| {
+            std.log.err("Error getting peer: {}", .{err});
+            stream.close(rt);
+            return;
+        };
+        if (peer_gop.found_existing) {
+            // peer with username exists
+            const peer = peer_gop.value_ptr.*;
+            if (peer.connection_state.load(.seq_cst) == .connected) {
+                // the indirect connection won the race
+                self.peers_mutex.unlock();
+                stream.close(rt);
+                return;
+            } else {
+                // we've won the race, assume ownership of peer
+                peer.connection_state.store(.connected, .seq_cst);
+                const old_socket = peer.socket;
+                peer.socket = stream;
+                self.peers_mutex.unlock();
+
+                // close socket to trigger teardown on other thread
+                if (old_socket) |sock| sock.close(rt);
+
+                // run peer (reuse buffered reader)
+                peer.run(rt, .incoming, &reader);
+
+                // cleanup (like runPeer)
+                self.peers_mutex.lock();
+                _ = self.peers.remove(peer.username);
+                std.log.debug("Peer '{s}' disconnected. There are now {d} active P2P connections.", .{ peer.username, self.connected_peer_count.load(.seq_cst) });
+                self.peers_mutex.unlock();
+                peer.deinit(rt);
+                self.allocator.destroy(peer);
+            }
+        } else {
+            // new peer
+            const peer = PeerConnection.init(self.allocator, self, peer_init_msg.username, self.own_username.?, peer_init_msg.token) catch |err| {
+                std.log.err("Error initializing peer: {}", .{err});
+                _ = self.peers.remove(peer_init_msg.username);
+                self.peers_mutex.unlock();
+                return;
+            };
+
+            // already connected, directly assign socket
+            peer.socket = stream;
+
+            // update hashmap ptrs before releasing lock
+            peer_gop.key_ptr.* = peer.username; // update key to peer owned memory
+            peer_gop.value_ptr.* = peer;
+            self.peers_mutex.unlock();
+
+            // run peer (reuse buffered reader)
+            peer.run(rt, .incoming, &reader);
+
+            // cleanup (like runPeer)
+            self.peers_mutex.lock();
+            _ = self.peers.remove(peer.username);
+            std.log.debug("Peer '{s}' disconnected. There are now {d} active P2P connections.", .{ peer.username, self.connected_peer_count.load(.seq_cst) });
+            self.peers_mutex.unlock();
+            peer.deinit(rt);
+            self.allocator.destroy(peer);
         }
     }
 
@@ -534,7 +635,7 @@ pub const Client = struct {
                     return;
                 };
                 if (peer_gop.found_existing) {
-                    // peer with username exists
+                    // peer with username exists, no need to continue
                     self.peers_mutex.unlock();
                     return;
                 }
@@ -561,6 +662,12 @@ pub const Client = struct {
                     }
 
                     self.peers_mutex.lock();
+                    // check if race lost to incoming direct connection
+                    if (peer.connection_state.load(.seq_cst) == .connected) {
+                        // race lost, peer is owned
+                        self.peers_mutex.unlock();
+                        return;
+                    }
                     _ = self.peers.remove(msg.username);
                     self.peers_mutex.unlock();
                     peer.deinit(rt); // peer is not yet running, deinit
@@ -569,7 +676,7 @@ pub const Client = struct {
                 };
 
                 // spawn peer and run
-                self.spawnPeer(rt, peer, false) catch |err| {
+                self.spawnPeer(rt, peer, .outgoing_indirect) catch |err| {
                     std.log.err("Error spawning & running peer: {}", .{err});
                 };
             },
@@ -665,19 +772,23 @@ pub const Client = struct {
         };
 
         // spawn peer and run
-        try self.spawnPeer(rt, peer, true);
+        try self.spawnPeer(rt, peer, .outgoing_direct);
 
         return peer;
     }
 
     // Spawns peer and begins running.
-    fn spawnPeer(self: *Client, rt: *zio.Runtime, peer: *PeerConnection, we_initiated: bool) !void {
-        try self.peer_group.spawn(rt, runPeer, .{ self, rt, peer, we_initiated });
+    fn spawnPeer(self: *Client, rt: *zio.Runtime, peer: *PeerConnection, handshake_type: types.HandshakeType) !void {
+        try self.peer_group.spawn(rt, runPeer, .{ self, rt, peer, handshake_type });
     }
 
     // Runs the peer.
-    fn runPeer(self: *Client, rt: *zio.Runtime, peer: *PeerConnection, we_initiated: bool) void {
-        peer.run(rt, we_initiated);
+    fn runPeer(self: *Client, rt: *zio.Runtime, peer: *PeerConnection, handshake_type: types.HandshakeType) void {
+        // reader for socket
+        var read_buf: [4096]u8 = undefined;
+        var reader = peer.socket.?.reader(rt, &read_buf);
+
+        peer.run(rt, handshake_type, &reader);
 
         // cleanup
         self.peers_mutex.lock();
@@ -1054,32 +1165,34 @@ pub const PeerConnection = struct {
     }
 
     // Self-contained peer connection logic.
-    pub fn run(self: *PeerConnection, rt: *zio.Runtime, we_initiated: bool) void {
-        // reader for socket
-        var read_buf: [4096]u8 = undefined;
-        var reader = self.socket.?.reader(rt, &read_buf);
-
+    pub fn run(self: *PeerConnection, rt: *zio.Runtime, handshake_type: types.HandshakeType, reader: *zio.net.Stream.Reader) void {
         // send correct handshake
-        if (we_initiated) {
-            const msg = messages.PeerInit{
-                .username = self.own_username,
-                .type = @tagName(types.ConnectionType.P),
-                .token = 0,
-            };
+        switch (handshake_type) {
+            .outgoing_direct => {
+                const msg = messages.PeerInit{
+                    .username = self.own_username,
+                    .type = @tagName(types.ConnectionType.P),
+                    .token = 0,
+                };
 
-            self.sendPeerInitMessage(rt, .{ .peerInit = msg }) catch |err| {
-                std.log.err("Failed to send PeerInit to {s}: {}", .{ self.username, err });
-                return;
-            };
-        } else {
-            const msg = messages.PierceFireWall{
-                .token = self.token,
-            };
+                self.sendPeerInitMessage(rt, .{ .peerInit = msg }) catch |err| {
+                    std.log.err("Failed to send PeerInit to {s}: {}", .{ self.username, err });
+                    return;
+                };
+            },
+            .outgoing_indirect => {
+                const msg = messages.PierceFireWall{
+                    .token = self.token,
+                };
 
-            self.sendPeerInitMessage(rt, .{ .pierceFireWall = msg }) catch |err| {
-                std.log.err("Failed to send PierceFirewall to {s}: {}", .{ self.username, err });
-                return;
-            };
+                self.sendPeerInitMessage(rt, .{ .pierceFireWall = msg }) catch |err| {
+                    std.log.err("Failed to send PierceFirewall to {s}: {}", .{ self.username, err });
+                    return;
+                };
+            },
+            .incoming => {
+                // PeerInit was read by our P2P handler, no need to do anything here
+            },
         }
 
         // handshake done, good to go
@@ -1091,7 +1204,7 @@ pub const PeerConnection = struct {
         defer _ = self.client.connected_peer_count.fetchSub(1, .seq_cst);
 
         // begin read loop
-        self.readLoop(rt, &reader);
+        self.readLoop(rt, reader);
     }
 
     // Gets the connected peer's user info.

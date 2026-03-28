@@ -13,6 +13,13 @@ pub const ConnectionType = enum {
     D, // distributed network
 };
 
+/// Enum representing what type of handshake must be done on a connection.
+pub const HandshakeType = enum {
+    outgoing_direct, // we connect directly - PeerInit
+    outgoing_indirect, // we connect indirectly - PierceFireWall
+    incoming, // they connected to us (and sent PeerInit) - none
+};
+
 /// Structure representing a client's configurable user info to share with peers.
 pub const UserInfoConfig = struct {
     description: []const u8, // a biography essentially

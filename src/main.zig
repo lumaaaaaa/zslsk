@@ -5,7 +5,7 @@ const zio = @import("zio");
 // constants
 const HOST: []const u8 = "server.slsknet.org";
 const PORT: u16 = 2242;
-const LISTEN_PORT: u16 = 22340;
+const LISTEN_PORT: u16 = 2234;
 const DEFAULT_TERM_WIDTH: u16 = 80;
 
 const Command = enum {
