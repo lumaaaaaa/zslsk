@@ -391,7 +391,7 @@ pub const Client = struct {
         if (message_code == 0) {
             // PierceFireWall received, this is an outgoing indirect connection we requested
             // TODO: unstub, handle
-            std.log.warn("Unimplemented!", .{});
+            std.log.warn("Unimplemented! (outgoing_indirect)", .{});
             stream.close(rt);
             return;
         } else if (message_code == 1) {
@@ -406,8 +406,11 @@ pub const Client = struct {
             defer peer_init_msg.deinit(self.allocator);
 
             // TODO: handle all different connection types
-            const connection_type = std.meta.stringToEnum(types.ConnectionType, peer_init_msg.type);
-            switch (connection_type.?) {
+            const connection_type = std.meta.stringToEnum(types.ConnectionType, peer_init_msg.type) orelse {
+                std.log.err("Peer requested an unknown connection type", .{});
+                return;
+            };
+            switch (connection_type) {
                 .P => {
                     std.log.debug("Incoming direct peer connection from user '{s}'", .{peer_init_msg.username});
 
@@ -650,8 +653,11 @@ pub const Client = struct {
         defer msg.deinit(self.allocator);
 
         // TODO: handle all different connection types
-        const connection_type = std.meta.stringToEnum(types.ConnectionType, msg.type);
-        switch (connection_type.?) {
+        const connection_type = std.meta.stringToEnum(types.ConnectionType, msg.type) orelse {
+            std.log.err("Peer requested an unknown connection type", .{});
+            return;
+        };
+        switch (connection_type) {
             // p2p
             types.ConnectionType.P => {
                 // get peer
@@ -1010,7 +1016,7 @@ pub const DistributedConnection = struct {
                     self.connection_state.store(.disconnected, .seq_cst);
                     return;
                 }
-                std.log.err("Error encountered in peer readResponse: {}", .{err});
+                std.log.err("Error encountered in distributed peer readResponse: {}", .{err});
                 continue;
             };
 
@@ -1019,11 +1025,17 @@ pub const DistributedConnection = struct {
             defer if (should_deinit) message.deinit(self.allocator);
 
             // handle async message types
-            std.log.debug("== Received DistributedMessage: {s} (code: {d}) ==", .{ @tagName(message), message.code() });
+            //std.log.debug("== Received DistributedMessage: {s} (code: {d}) ==", .{ @tagName(message), message.code() });
             switch (message) {
-                .search => |msg| std.log.debug("\tSearch: user {s} is looking for '{s}'", .{ msg.username, msg.query }),
-                .branchLevel => |msg| std.log.debug("\tDistributed peer {s} has branch level {d}", .{ self.username, msg.level }),
-                .branchRoot => |msg| std.log.debug("\tDistributed peer {s} has branch root {s}", .{ self.username, msg.root }),
+                .search => {
+                    //std.log.debug("\tSearch: user {s} is looking for '{s}'", .{ msg.username, msg.query });
+                },
+                .branchLevel => |msg| {
+                    std.log.debug("\tDistributed peer {s} has branch level {d}", .{ self.username, msg.level });
+                },
+                .branchRoot => |msg| {
+                    std.log.debug("\tDistributed peer {s} has branch root {s}", .{ self.username, msg.root });
+                },
             }
         }
     }
