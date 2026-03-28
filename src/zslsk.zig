@@ -387,86 +387,112 @@ pub const Client = struct {
             return;
         };
 
-        // message must be PeerInit
-        if (message_code != 1) {
+        //
+        if (message_code == 0) {
+            // PierceFireWall received, this is an outgoing indirect connection we requested
+            // TODO: unstub, handle
+            std.log.warn("Unimplemented!", .{});
+            stream.close(rt);
+            return;
+        } else if (message_code == 1) {
+            // PeerInit received, this is an incoming direct connection
+
+            // read incoming PeerInit to get username and message type
+            var peer_init_msg = messages.PeerInit.parse(self.allocator, &reader.interface) catch |err| {
+                std.log.err("Error reading PeerInit message from incoming connection: {}", .{err});
+                stream.close(rt);
+                return;
+            };
+            defer peer_init_msg.deinit(self.allocator);
+
+            // TODO: handle all different connection types
+            const connection_type = std.meta.stringToEnum(types.ConnectionType, peer_init_msg.type);
+            switch (connection_type.?) {
+                .P => {
+                    std.log.debug("Incoming direct peer connection from user '{s}'", .{peer_init_msg.username});
+
+                    // get peer
+                    self.peers_mutex.lock();
+                    const peer_gop = self.peers.getOrPut(peer_init_msg.username) catch |err| {
+                        std.log.err("Error getting peer: {}", .{err});
+                        stream.close(rt);
+                        return;
+                    };
+                    if (peer_gop.found_existing) {
+                        // peer with username exists
+                        const peer = peer_gop.value_ptr.*;
+                        if (peer.connection_state.load(.seq_cst) == .connected) {
+                            // the indirect connection won the race
+                            self.peers_mutex.unlock();
+                            stream.close(rt);
+                            return;
+                        } else {
+                            // we've won the race, assume ownership of peer
+                            peer.connection_state.store(.connected, .seq_cst);
+                            const old_socket = peer.socket;
+                            peer.socket = stream;
+                            self.peers_mutex.unlock();
+
+                            // close socket to trigger teardown on other thread
+                            if (old_socket) |sock| sock.close(rt);
+
+                            // run peer (reuse buffered reader)
+                            peer.run(rt, .incoming, &reader);
+
+                            // cleanup (like runPeer)
+                            self.peers_mutex.lock();
+                            _ = self.peers.remove(peer.username);
+                            std.log.debug("Peer '{s}' disconnected. There are now {d} active P2P connections.", .{ peer.username, self.connected_peer_count.load(.seq_cst) });
+                            self.peers_mutex.unlock();
+                            peer.deinit(rt);
+                            self.allocator.destroy(peer);
+                        }
+                    } else {
+                        // new peer
+                        const peer = PeerConnection.init(self.allocator, self, peer_init_msg.username, self.own_username.?, peer_init_msg.token) catch |err| {
+                            std.log.err("Error initializing peer: {}", .{err});
+                            _ = self.peers.remove(peer_init_msg.username);
+                            self.peers_mutex.unlock();
+                            return;
+                        };
+
+                        // already connected, directly assign socket
+                        peer.socket = stream;
+
+                        // update hashmap ptrs before releasing lock
+                        peer_gop.key_ptr.* = peer.username; // update key to peer owned memory
+                        peer_gop.value_ptr.* = peer;
+                        self.peers_mutex.unlock();
+
+                        // run peer (reuse buffered reader)
+                        peer.run(rt, .incoming, &reader);
+
+                        // cleanup (like runPeer)
+                        self.peers_mutex.lock();
+                        _ = self.peers.remove(peer.username);
+                        std.log.debug("Peer '{s}' disconnected. There are now {d} active P2P connections.", .{ peer.username, self.connected_peer_count.load(.seq_cst) });
+                        self.peers_mutex.unlock();
+                        peer.deinit(rt);
+                        self.allocator.destroy(peer);
+                    }
+                },
+                .F => {
+                    std.log.debug("Incoming direct file connection from user '{s}'", .{peer_init_msg.username});
+                    std.log.warn("Unimplemented!", .{});
+                    stream.close(rt);
+                    return;
+                },
+                .D => {
+                    std.log.debug("Incoming direct distributed connection from user '{s}'", .{peer_init_msg.username});
+                    std.log.warn("Unimplemented!", .{});
+                    stream.close(rt);
+                    return;
+                },
+            }
+        } else {
             std.log.err("A user attempted to start an incoming connection with an unexpected message.", .{});
             stream.close(rt);
             return;
-        }
-
-        // read incoming PeerInit to get username of connecting peer
-        var peer_init_msg = messages.PeerInit.parse(self.allocator, &reader.interface) catch |err| {
-            std.log.err("Error reading PeerInit message from incoming connection: {}", .{err});
-            stream.close(rt);
-            return;
-        };
-        defer peer_init_msg.deinit(self.allocator);
-
-        std.log.debug("Incoming direct connection from user '{s}'", .{peer_init_msg.username});
-
-        // get peer
-        self.peers_mutex.lock();
-        const peer_gop = self.peers.getOrPut(peer_init_msg.username) catch |err| {
-            std.log.err("Error getting peer: {}", .{err});
-            stream.close(rt);
-            return;
-        };
-        if (peer_gop.found_existing) {
-            // peer with username exists
-            const peer = peer_gop.value_ptr.*;
-            if (peer.connection_state.load(.seq_cst) == .connected) {
-                // the indirect connection won the race
-                self.peers_mutex.unlock();
-                stream.close(rt);
-                return;
-            } else {
-                // we've won the race, assume ownership of peer
-                peer.connection_state.store(.connected, .seq_cst);
-                const old_socket = peer.socket;
-                peer.socket = stream;
-                self.peers_mutex.unlock();
-
-                // close socket to trigger teardown on other thread
-                if (old_socket) |sock| sock.close(rt);
-
-                // run peer (reuse buffered reader)
-                peer.run(rt, .incoming, &reader);
-
-                // cleanup (like runPeer)
-                self.peers_mutex.lock();
-                _ = self.peers.remove(peer.username);
-                std.log.debug("Peer '{s}' disconnected. There are now {d} active P2P connections.", .{ peer.username, self.connected_peer_count.load(.seq_cst) });
-                self.peers_mutex.unlock();
-                peer.deinit(rt);
-                self.allocator.destroy(peer);
-            }
-        } else {
-            // new peer
-            const peer = PeerConnection.init(self.allocator, self, peer_init_msg.username, self.own_username.?, peer_init_msg.token) catch |err| {
-                std.log.err("Error initializing peer: {}", .{err});
-                _ = self.peers.remove(peer_init_msg.username);
-                self.peers_mutex.unlock();
-                return;
-            };
-
-            // already connected, directly assign socket
-            peer.socket = stream;
-
-            // update hashmap ptrs before releasing lock
-            peer_gop.key_ptr.* = peer.username; // update key to peer owned memory
-            peer_gop.value_ptr.* = peer;
-            self.peers_mutex.unlock();
-
-            // run peer (reuse buffered reader)
-            peer.run(rt, .incoming, &reader);
-
-            // cleanup (like runPeer)
-            self.peers_mutex.lock();
-            _ = self.peers.remove(peer.username);
-            std.log.debug("Peer '{s}' disconnected. There are now {d} active P2P connections.", .{ peer.username, self.connected_peer_count.load(.seq_cst) });
-            self.peers_mutex.unlock();
-            peer.deinit(rt);
-            self.allocator.destroy(peer);
         }
     }
 
@@ -623,7 +649,7 @@ pub const Client = struct {
         var msg = resp;
         defer msg.deinit(self.allocator);
 
-        // TODO: handle different connection types
+        // TODO: handle all different connection types
         const connection_type = std.meta.stringToEnum(types.ConnectionType, msg.type);
         switch (connection_type.?) {
             // p2p
