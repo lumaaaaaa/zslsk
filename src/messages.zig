@@ -211,14 +211,18 @@ pub const LoginResponse = struct {
 
         if (response.success) {
             response.greeting = try readString(allocator, reader);
+            errdefer allocator.free(response.greeting.?);
             response.ip_address = try readIP(reader);
             response.hash = try readString(allocator, reader);
+            errdefer allocator.free(response.hash.?);
             response.is_supporter = (try reader.takeByte() == 1);
         } else {
             response.rejection_reason = try readString(allocator, reader);
+            errdefer allocator.free(response.rejection_reason.?);
             // check if there are rejection details
             if (reader.seek - 4 < payload_len) {
                 response.rejection_detail = try readString(allocator, reader);
+                errdefer allocator.free(response.rejection_detail.?);
             }
         }
 
@@ -239,12 +243,19 @@ pub const GetPeerAddressResponse = struct {
     }
 
     pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !GetPeerAddressResponse {
+        const username = try readString(allocator, reader);
+        errdefer allocator.free(username);
+        const ip = try readIP(reader);
+        const port = try reader.takeInt(u32, .little);
+        const obfuscation_type = try reader.takeInt(u32, .little);
+        const obfuscation_port = try reader.takeInt(u16, .little);
+
         return GetPeerAddressResponse{
-            .username = try readString(allocator, reader),
-            .ip = try readIP(reader),
-            .port = try reader.takeInt(u32, .little),
-            .obfuscation_type = try reader.takeInt(u32, .little),
-            .obfuscated_port = try reader.takeInt(u16, .little),
+            .username = username,
+            .ip = ip,
+            .port = port,
+            .obfuscation_type = obfuscation_type,
+            .obfuscated_port = obfuscation_port,
         };
     }
 };
@@ -266,15 +277,26 @@ pub const ConnectToPeerResponse = struct {
     }
 
     pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !ConnectToPeerResponse {
+        const username = try readString(allocator, reader);
+        errdefer allocator.free(username);
+        const conn_type = try readString(allocator, reader);
+        errdefer allocator.free(conn_type);
+        const ip = try readIP(reader);
+        const port = try reader.takeInt(u32, .little);
+        const token = try reader.takeInt(u32, .little);
+        const privileged = (try reader.takeByte() == 1);
+        const obfuscation_type = try reader.takeInt(u32, .little);
+        const obfuscation_port = try reader.takeInt(u32, .little);
+
         return ConnectToPeerResponse{
-            .username = try readString(allocator, reader),
-            .type = try readString(allocator, reader),
-            .ip = try readIP(reader),
-            .port = try reader.takeInt(u32, .little),
-            .token = try reader.takeInt(u32, .little),
-            .privileged = (try reader.takeByte() == 1),
-            .obfuscation_type = try reader.takeInt(u32, .little),
-            .obfuscated_port = try reader.takeInt(u32, .little),
+            .username = username,
+            .type = conn_type,
+            .ip = ip,
+            .port = port,
+            .token = token,
+            .privileged = privileged,
+            .obfuscation_type = obfuscation_type,
+            .obfuscated_port = obfuscation_port,
         };
     }
 };
@@ -293,12 +315,20 @@ pub const MessageUserResponse = struct {
     }
 
     pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !MessageUserResponse {
+        const id = try reader.takeInt(u32, .little);
+        const timestamp = try reader.takeInt(u32, .little);
+        const username = try readString(allocator, reader);
+        errdefer allocator.free(username);
+        const message = try readString(allocator, reader);
+        errdefer allocator.free(message);
+        const new_message = (try reader.takeByte() == 1);
+
         return MessageUserResponse{
-            .id = try reader.takeInt(u32, .little),
-            .timestamp = try reader.takeInt(u32, .little),
-            .username = try readString(allocator, reader),
-            .message = try readString(allocator, reader),
-            .new_message = (try reader.takeByte() == 1),
+            .id = id,
+            .timestamp = timestamp,
+            .username = username,
+            .message = message,
+            .new_message = new_message,
         };
     }
 };
@@ -376,11 +406,28 @@ pub const RoomListResponse = struct {
     }
 
     pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !RoomListResponse {
+        const rooms = try readRooms(reader, allocator, false);
+        errdefer {
+            for (rooms) |*room| room.deinit(allocator);
+            allocator.free(rooms);
+        }
+        const owned_private_rooms = try readRooms(reader, allocator, false);
+        errdefer {
+            for (owned_private_rooms) |*room| room.deinit(allocator);
+            allocator.free(owned_private_rooms);
+        }
+        const unowned_private_rooms = try readRooms(reader, allocator, false);
+        errdefer {
+            for (unowned_private_rooms) |*room| room.deinit(allocator);
+            allocator.free(unowned_private_rooms);
+        }
+        const operated_private_rooms = try readRooms(reader, allocator, true); // operated private rooms do not share user count
+
         return RoomListResponse{
-            .rooms = try readRooms(reader, allocator, false),
-            .owned_private_rooms = try readRooms(reader, allocator, false),
-            .unowned_private_rooms = try readRooms(reader, allocator, false),
-            .operated_private_rooms = try readRooms(reader, allocator, true), // operated private rooms do not share user count
+            .rooms = rooms,
+            .owned_private_rooms = owned_private_rooms,
+            .unowned_private_rooms = unowned_private_rooms,
+            .operated_private_rooms = operated_private_rooms,
         };
     }
 
@@ -637,6 +684,7 @@ pub const SearchMessage = struct {
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !SearchMessage {
         _ = try reader.takeInt(u32, .little);
         const username = try readString(allocator, reader);
+        errdefer allocator.free(username);
         const token = try reader.takeInt(u32, .little);
         const query = try readString(allocator, reader);
 
@@ -665,10 +713,8 @@ pub const BranchLevelMessage = struct {
     }
 
     pub fn parse(reader: *std.Io.Reader) !BranchLevelMessage {
-        const level = try reader.takeInt(i32, .little);
-
         return BranchLevelMessage{
-            .level = level,
+            .level = try reader.takeInt(i32, .little),
         };
     }
 
@@ -686,10 +732,8 @@ pub const BranchRootMessage = struct {
     }
 
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !BranchRootMessage {
-        const root = try readString(allocator, reader);
-
         return BranchRootMessage{
-            .root = root,
+            .root = try readString(allocator, reader),
         };
     }
 
@@ -781,10 +825,16 @@ pub const SharedFileListMessage = struct {
 
         const dir_count = try decompressor.reader.takeInt(u32, .little);
         const directories = try allocator.alloc(SharedDirectory, dir_count);
-        errdefer allocator.free(directories);
+        var dirs_parsed: usize = 0;
+        errdefer {
+            for (directories[0..dirs_parsed]) |*dir| {
+                dir.deinit(allocator);
+            }
+            allocator.free(directories);
+        }
         for (directories) |*dir| {
             dir.* = try SharedDirectory.parse(allocator, &decompressor.reader);
-            errdefer dir.deinit(allocator);
+            dirs_parsed += 1;
         }
 
         // official clients read u32 0
@@ -792,10 +842,16 @@ pub const SharedFileListMessage = struct {
 
         const priv_dir_count = decompressor.reader.takeInt(u32, .little) catch 0;
         const private_directories = try allocator.alloc(SharedDirectory, priv_dir_count);
-        errdefer allocator.free(private_directories);
+        var priv_dirs_parsed: usize = 0;
+        errdefer {
+            for (private_directories[0..priv_dirs_parsed]) |*dir| {
+                dir.deinit(allocator);
+            }
+            allocator.free(private_directories);
+        }
         for (private_directories) |*dir| {
             dir.* = try SharedDirectory.parse(allocator, &decompressor.reader);
-            errdefer dir.deinit(allocator);
+            priv_dirs_parsed += 1;
         }
 
         return SharedFileListMessage{
@@ -1232,10 +1288,8 @@ pub const QueueUploadMessage = struct {
     }
 
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !QueueUploadMessage {
-        const filename = try readString(allocator, reader);
-
         return QueueUploadMessage{
-            .filename = filename,
+            .filename = try readString(allocator, reader),
         };
     }
 
@@ -1253,10 +1307,8 @@ pub const UploadFailedMessage = struct {
     }
 
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !UploadFailedMessage {
-        const filename = try readString(allocator, reader);
-
         return UploadFailedMessage{
-            .filename = filename,
+            .filename = try readString(allocator, reader),
         };
     }
 
@@ -1277,6 +1329,7 @@ pub const UploadDeniedMessage = struct {
 
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !UploadDeniedMessage {
         const filename = try readString(allocator, reader);
+        errdefer allocator.free(filename);
         const reason = try readString(allocator, reader);
 
         return UploadDeniedMessage{
@@ -1359,10 +1412,16 @@ pub const PeerInit = struct {
     }
 
     pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) !PeerInit {
+        const username = try readString(allocator, reader);
+        errdefer allocator.free(username);
+        const conn_type = try readString(allocator, reader);
+        errdefer allocator.free(conn_type);
+        const token = try reader.takeInt(u32, .little);
+
         return PeerInit{
-            .username = try readString(allocator, reader),
-            .type = try readString(allocator, reader),
-            .token = try reader.takeInt(u32, .little),
+            .username = username,
+            .type = conn_type,
+            .token = token,
         };
     }
 
@@ -1393,10 +1452,8 @@ pub const FileTransferInitMessage = struct {
     token: u32,
 
     pub fn parse(reader: *std.Io.Reader) !FileTransferInitMessage {
-        const token = try reader.takeInt(u32, .little);
-
         return FileTransferInitMessage{
-            .token = token,
+            .token = try reader.takeInt(u32, .little),
         };
     }
 
@@ -1410,10 +1467,8 @@ pub const FileOffsetMessage = struct {
     offset: u64,
 
     pub fn parse(reader: *std.Io.Reader) !FileOffsetMessage {
-        const offset = try reader.takeInt(u64, .little);
-
         return FileOffsetMessage{
-            .offset = offset,
+            .offset = try reader.takeInt(u64, .little),
         };
     }
 
