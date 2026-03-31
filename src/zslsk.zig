@@ -36,10 +36,14 @@ pub const Client = struct {
     p2p_server: ?zio.net.Server = null, // server listening for p2p connections
     peers: std.StringHashMap(*PeerConnection), // established peer connections
     peers_mutex: std.Thread.Mutex = .{},
-    distributed_connections: std.StringHashMap(*DistributedConnection), // establish distributed connections
+    distributed_connections: std.StringHashMap(*DistributedConnection), // established distributed connections
     distributed_mutex: std.Thread.Mutex = .{},
     own_username: ?[]const u8 = null,
     connected_peer_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    // consumer configurable fields
+    shared_dirs: std.StringHashMap(messages.SharedDirectory),
+    shared_priv_dirs: std.StringHashMap(messages.SharedDirectory),
     user_info: types.UserInfoConfig = .{ .description = "hello from https://github.com/lumaaaaaa/zslsk", .picture = null },
 
     // group for peer task execution
@@ -59,6 +63,8 @@ pub const Client = struct {
         return .{
             .allocator = allocator,
             .peers = .init(allocator),
+            .shared_dirs = .init(allocator),
+            .shared_priv_dirs = .init(allocator),
             .distributed_connections = .init(allocator),
             .get_peer_address_channels = .init(allocator),
             .user_interests_channels = .init(allocator),
@@ -192,6 +198,20 @@ pub const Client = struct {
         self.peers_mutex.unlock();
 
         self.peer_group.cancel(rt);
+    }
+
+    /// Adds a directory to the share list. Expects path to be absolute.
+    pub fn addShare(self: *Client, rt: *zio.Runtime, io: std.Io, path: []const u8) !void {
+        const dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+        defer dir.close(io);
+        try self.scanDir(rt, io, dir, std.fs.path.basename(path), &self.shared_dirs);
+    }
+
+    /// Adds a directory to the private share list.
+    pub fn addPrivateShare(self: *Client, rt: *zio.Runtime, io: std.Io, path: []const u8) !void {
+        const dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+        defer dir.close(io);
+        try self.scanDir(rt, io, dir, std.fs.path.basename(path), &self.shared_priv_dirs);
     }
 
     /// Gets user info of the user with the specified username.
@@ -328,6 +348,74 @@ pub const Client = struct {
     }
 
     /// Internal Library Functions ///
+    // Recursive function to scan a directory and append entries to a destination map.
+    fn scanDir(self: *Client, rt: *zio.Runtime, io: std.Io, dir: std.Io.Dir, path: []const u8, dest: *std.StringHashMap(messages.SharedDirectory)) !void {
+        // storage for SharedFile objects in directory
+        var files: std.ArrayList(messages.SharedFile) = .empty;
+        errdefer files.deinit(self.allocator);
+
+        // iterate target directory
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            switch (entry.kind) {
+                .file => {
+                    // append to files
+                    const ext = std.fs.path.extension(entry.name);
+                    const stat = try dir.statFile(io, entry.name, .{});
+                    try files.append(self.allocator, .{
+                        .code = 1,
+                        .name = try self.allocator.dupe(u8, entry.name),
+                        .size = stat.size,
+                        .extension = try self.allocator.dupe(u8, ext),
+                        .attributes = &.{},
+                    });
+                },
+                .directory => {
+                    // open subdirectory and recurse
+                    const sub_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
+                    defer self.allocator.free(sub_path);
+
+                    const sub_dir = try dir.openDir(io, entry.name, .{ .iterate = true });
+                    defer sub_dir.close(io);
+
+                    try self.scanDir(rt, io, sub_dir, sub_path, dest);
+                },
+                else => {}, // ignore
+            }
+        }
+
+        if (files.items.len > 0) {
+            const win_path = try toWindowsPath(self.allocator, path);
+            errdefer self.allocator.free(win_path);
+
+            // add to destination map
+            try dest.put(win_path, .{
+                .name = win_path,
+                .files = try files.toOwnedSlice(self.allocator),
+            });
+        }
+    }
+
+    // Converts Unix paths to Windows paths. Soulseek uses Windows paths in the protocol.
+    fn toWindowsPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        return try std.mem.replaceOwned(u8, allocator, path, "/", "\\");
+    }
+
+    // Converts the internal share map representation to the proper protocol structure.
+    pub fn formatShares(self: *Client, map: *const std.StringHashMap(messages.SharedDirectory)) ![]messages.SharedDirectory {
+        const list = try self.allocator.alloc(messages.SharedDirectory, map.count());
+        var i: usize = 0;
+
+        // drop keys
+        var it = map.valueIterator();
+        while (it.next()) |entry| {
+            list[i] = entry.*;
+            i += 1;
+        }
+
+        return list;
+    }
+
     // P2P listener.
     fn p2pListenerTask(self: *Client, rt: *zio.Runtime, listen_port: u16) void {
         // listen for p2p connections
@@ -1514,26 +1602,22 @@ pub const PeerConnection = struct {
                 .getSharedFileList => {
                     std.log.debug("\t{s} requests our shared files", .{self.username});
 
-                    const files = self.allocator.alloc(messages.SharedFile, 1) catch continue;
-                    defer self.allocator.free(files);
-                    files[0] = .{
-                        .code = 1,
-                        .name = "hello_world.zig",
-                        .size = 420,
-                        .extension = "zig",
-                        .attributes = &[_]messages.FileAttributes{},
+                    // convert internal share representation to protocol structure
+                    const dirs = self.client.formatShares(&self.client.shared_dirs) catch |err| {
+                        std.log.err("\tFailed to format shared directories: {}", .{err});
+                        continue;
                     };
-
-                    const dirs = self.allocator.alloc(messages.SharedDirectory, 1) catch continue;
                     defer self.allocator.free(dirs);
-                    dirs[0] = .{
-                        .name = "zslsk\\files",
-                        .files = files,
+
+                    const priv_dirs = self.client.formatShares(&self.client.shared_priv_dirs) catch |err| {
+                        std.log.err("\tFailed to format shared private directories: {}", .{err});
+                        continue;
                     };
+                    defer self.allocator.free(priv_dirs);
 
                     const msg = messages.SharedFileListMessage{
                         .directories = dirs,
-                        .private_directories = &[_]messages.SharedDirectory{},
+                        .private_directories = priv_dirs,
                     };
 
                     // send shared file list to peer

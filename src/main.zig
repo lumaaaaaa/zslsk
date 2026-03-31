@@ -12,17 +12,17 @@ const Command = enum {
     download, // downloads a target file from a target username (ex. download <username> <filename>)
     filelist, // retrieves file list for a target username (ex. filelist <username>)
     msg, // sends a message to a target user (ex. msg <username> <content>)
+    share, // adds a local directory to the share list (ex. share <abs path>)
     search, // searches network for files matching a target query (ex. search <query>)
     userinfo, // retrieves user info for a target username (ex. userinfo <username>)
     exit, // exits the application
 };
 
 // zslsk test application entrypoint
-pub fn main() !void {
-    // create general purpose allocator
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
+pub fn main(init: std.process.Init) !void {
+    // get juicy main args
+    const io = init.io;
+    const allocator = init.gpa;
 
     // create zio runtime
     var rt = try zio.Runtime.init(allocator, .{ .thread_pool = .{} });
@@ -40,13 +40,13 @@ pub fn main() !void {
     defer client.deinit();
 
     // run application inside zio runtime
-    var task = try rt.spawn(app, .{ rt, &client, allocator, username, password });
+    var task = try rt.spawn(app, .{ rt, &client, allocator, io, username, password });
     try task.join(rt);
 
     print(rt, "[info] shutting down...\n", .{});
 }
 
-fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, username: []const u8, password: []const u8) !void {
+fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, io: std.Io, username: []const u8, password: []const u8) !void {
     var client_group: zio.Group = .init;
     defer client_group.cancel(rt);
 
@@ -90,13 +90,6 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                             continue;
                         };
                         defer dl_channel.deinit(rt, allocator);
-
-                        // zig new std.Io to access std.Io.random
-                        var threaded = std.Io.Threaded.init(allocator, .{
-                            .environ = .empty,
-                        }); // HACK: short lived std.Io instance cause rt.io() panics :(
-                        defer threaded.deinit();
-                        const io = threaded.ioBasic();
 
                         // create/open file for writing
                         const filename = std.fs.path.basenameWindows(filepath);
@@ -189,10 +182,23 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, us
                         };
                         print(rt, "Message sent.\n", .{});
                     },
+                    Command.share => {
+                        const path = it.rest();
+                        if (path.len == 0) {
+                            print(rt, "[error] syntax: share <abs path>\n", .{});
+                            continue;
+                        }
+                        client.addShare(rt, io, path) catch |err| {
+                            std.log.err("Could not add share: {}", .{err});
+                            continue;
+                        };
+                        print(rt, "Share added.\n", .{});
+                    },
                     Command.search => {
                         const query = it.rest();
                         if (query.len == 0) {
                             print(rt, "[error] syntax: search <query>\n", .{});
+                            continue;
                         }
 
                         const channel = client.fileSearch(rt, query) catch |err| {
