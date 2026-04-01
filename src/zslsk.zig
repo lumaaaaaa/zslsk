@@ -1920,14 +1920,16 @@ pub const PeerConnection = struct {
                 .getUserInfo => {
                     std.log.debug("\t{s} requests our user info", .{self.username});
 
+                    self.client.upload_queue.impl.mutex.lock();
                     const msg = messages.UserInfoMessage{
                         .description = self.client.user_info.description,
                         .picture = self.client.user_info.picture,
-                        .queue_size = 0,
-                        .slots_free = true,
-                        .total_upload = 420,
+                        .queue_size = @intCast(self.client.upload_queue.impl.count),
+                        .slots_free = (self.client.active_uploads.load(.seq_cst) < self.client.upload_slots),
+                        .total_upload = self.client.upload_slots,
                         .upload_permitted = .everyone,
                     };
+                    self.client.upload_queue.impl.mutex.unlock();
 
                     self.sendPeerMessage(rt, .{ .userInfo = msg }) catch |err| {
                         std.log.err("\tFailed sending user info: {}", .{err});
