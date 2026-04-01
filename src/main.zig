@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(password);
 
     // initialize zslsk client
-    var client = try zslsk.Client.init(allocator);
+    var client = try zslsk.Client.init(allocator, io);
     defer client.deinit();
 
     // run application inside zio runtime
@@ -188,7 +188,7 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, io
                             print(rt, "[error] syntax: share <abs path>\n", .{});
                             continue;
                         }
-                        client.addShare(rt, io, path) catch |err| {
+                        client.addShare(rt, path) catch |err| {
                             std.log.err("Could not add share: {}", .{err});
                             continue;
                         };

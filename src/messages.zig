@@ -1298,7 +1298,7 @@ pub const QueueUploadMessage = struct {
     }
 };
 
-/// Represents peer code 46, a message to queue an upload.
+/// Represents peer code 46, a message to signal an upload failure.
 pub const UploadFailedMessage = struct {
     filename: []const u8,
 
@@ -1317,7 +1317,7 @@ pub const UploadFailedMessage = struct {
     }
 };
 
-/// Represents peer code 46, a message to queue an upload.
+/// Represents peer code 50, a message to signal upload denial.
 pub const UploadDeniedMessage = struct {
     filename: []const u8,
     reason: []const u8,

@@ -31,6 +31,7 @@ pub const DownloadChannel = struct {
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     connection_state: std.atomic.Value(ConnectionState) = std.atomic.Value(ConnectionState).init(.disconnected), // connection state
     socket: ?zio.net.Stream = null, // socket connection to centralized server
     p2p_server: ?zio.net.Server = null, // server listening for p2p connections
@@ -40,8 +41,17 @@ pub const Client = struct {
     distributed_mutex: std.Thread.Mutex = .{},
     own_username: ?[]const u8 = null,
     connected_peer_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    upload_queue_buf: []types.QueuedUpload,
+    upload_queue: zio.Channel(types.QueuedUpload),
+    active_uploads: std.atomic.Value(u32) = .init(0),
+    upload_slots: u32 = 10,
+
+    // map to route token to oneshot channels so indirect connections can be waited on
+    indirect_channels: std.AutoHashMap(u32, *zio.Channel(types.ConnectionResult)),
+    indirect_mutex: std.Thread.Mutex = .{},
 
     // consumer configurable fields
+    shared_real_paths: std.StringHashMap([]const u8),
     shared_dirs: std.StringHashMap(messages.SharedDirectory),
     shared_priv_dirs: std.StringHashMap(messages.SharedDirectory),
     user_info: types.UserInfoConfig = .{ .description = "hello from https://github.com/lumaaaaaa/zslsk", .picture = null },
@@ -59,10 +69,16 @@ pub const Client = struct {
     search_mutex: std.Thread.Mutex = .{},
 
     /// Exported Library Functions ///
-    pub fn init(allocator: std.mem.Allocator) !Client {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !Client {
+        const upload_buf = try allocator.alloc(types.QueuedUpload, 64);
         return .{
             .allocator = allocator,
+            .io = io,
             .peers = .init(allocator),
+            .upload_queue_buf = upload_buf,
+            .upload_queue = .init(upload_buf),
+            .indirect_channels = .init(allocator),
+            .shared_real_paths = .init(allocator),
             .shared_dirs = .init(allocator),
             .shared_priv_dirs = .init(allocator),
             .distributed_connections = .init(allocator),
@@ -74,6 +90,7 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         if (self.own_username) |username| self.allocator.free(username);
+        self.allocator.free(self.upload_queue_buf);
         self.get_peer_address_channels.deinit();
 
         var search_iter = self.search_result_channels.iterator();
@@ -94,6 +111,9 @@ pub const Client = struct {
         // shut down our connections
         if (self.socket) |s| s.close(rt);
         if (self.p2p_server) |s| s.close(rt);
+
+        // close upload queue
+        self.upload_queue.close(.graceful);
 
         // close searches
         self.search_mutex.lock();
@@ -181,6 +201,7 @@ pub const Client = struct {
 
         // dispatch concurrent tasks
         try self.peer_group.spawn(rt, p2pListenerTask, .{ self, rt, listen_port }); // p2p listener
+        try self.peer_group.spawn(rt, uploadQueueTask, .{ self, rt }); // upload queue dispatcher
 
         // begin read loop
         self.readLoop(rt, &reader);
@@ -201,17 +222,17 @@ pub const Client = struct {
     }
 
     /// Adds a directory to the share list. Expects path to be absolute.
-    pub fn addShare(self: *Client, rt: *zio.Runtime, io: std.Io, path: []const u8) !void {
-        const dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
-        defer dir.close(io);
-        try self.scanDir(rt, io, dir, std.fs.path.basename(path), &self.shared_dirs);
+    pub fn addShare(self: *Client, rt: *zio.Runtime, path: []const u8) !void {
+        const dir = try std.Io.Dir.openDirAbsolute(self.io, path, .{ .iterate = true });
+        defer dir.close(self.io);
+        try self.scanDir(rt, dir, std.fs.path.basename(path), path, &self.shared_dirs);
     }
 
     /// Adds a directory to the private share list.
-    pub fn addPrivateShare(self: *Client, rt: *zio.Runtime, io: std.Io, path: []const u8) !void {
-        const dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
-        defer dir.close(io);
-        try self.scanDir(rt, io, dir, std.fs.path.basename(path), &self.shared_priv_dirs);
+    pub fn addPrivateShare(self: *Client, rt: *zio.Runtime, path: []const u8) !void {
+        const dir = try std.Io.Dir.openDirAbsolute(self.io, path, .{ .iterate = true });
+        defer dir.close(self.io);
+        try self.scanDir(rt, dir, std.fs.path.basename(path), path, &self.shared_priv_dirs);
     }
 
     /// Gets user info of the user with the specified username.
@@ -260,16 +281,9 @@ pub const Client = struct {
 
     /// Searches network for files matching a specified query.
     pub fn fileSearch(self: *Client, rt: *zio.Runtime, query: []const u8) !SearchChannel {
-        // zig new std.Io to access std.Io.random
-        var threaded = std.Io.Threaded.init(self.allocator, .{
-            .environ = .empty,
-        }); // HACK: short lived std.Io instance because rt.io() panics :(
-        defer threaded.deinit();
-        const io = threaded.ioBasic();
-
         // generate a random token to track the search
         var token: u32 = undefined;
-        io.random(std.mem.asBytes(&token));
+        self.io.random(std.mem.asBytes(&token));
 
         // create a channel for the search results (backed by 256 FileSearchResponseMessages)
         const buf = try self.allocator.alloc(messages.FileSearchResponseMessage, 256);
@@ -349,19 +363,19 @@ pub const Client = struct {
 
     /// Internal Library Functions ///
     // Recursive function to scan a directory and append entries to a destination map.
-    fn scanDir(self: *Client, rt: *zio.Runtime, io: std.Io, dir: std.Io.Dir, path: []const u8, dest: *std.StringHashMap(messages.SharedDirectory)) !void {
+    fn scanDir(self: *Client, rt: *zio.Runtime, dir: std.Io.Dir, path: []const u8, abs_path: []const u8, dest: *std.StringHashMap(messages.SharedDirectory)) !void {
         // storage for SharedFile objects in directory
         var files: std.ArrayList(messages.SharedFile) = .empty;
         errdefer files.deinit(self.allocator);
 
         // iterate target directory
         var it = dir.iterate();
-        while (try it.next(io)) |entry| {
+        while (try it.next(self.io)) |entry| {
             switch (entry.kind) {
                 .file => {
                     // append to files
                     const ext = std.fs.path.extension(entry.name);
-                    const stat = try dir.statFile(io, entry.name, .{});
+                    const stat = try dir.statFile(self.io, entry.name, .{});
                     try files.append(self.allocator, .{
                         .code = 1,
                         .name = try self.allocator.dupe(u8, entry.name),
@@ -375,10 +389,13 @@ pub const Client = struct {
                     const sub_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
                     defer self.allocator.free(sub_path);
 
-                    const sub_dir = try dir.openDir(io, entry.name, .{ .iterate = true });
-                    defer sub_dir.close(io);
+                    const sub_abs_path = try std.fs.path.join(self.allocator, &.{ abs_path, entry.name });
+                    defer self.allocator.free(sub_abs_path);
 
-                    try self.scanDir(rt, io, sub_dir, sub_path, dest);
+                    const sub_dir = try dir.openDir(self.io, entry.name, .{ .iterate = true });
+                    defer sub_dir.close(self.io);
+
+                    try self.scanDir(rt, sub_dir, sub_path, sub_abs_path, dest);
                 },
                 else => {}, // ignore
             }
@@ -388,11 +405,15 @@ pub const Client = struct {
             const win_path = try toWindowsPath(self.allocator, path);
             errdefer self.allocator.free(win_path);
 
+            const real_path = try self.allocator.dupe(u8, abs_path);
+            errdefer self.allocator.free(real_path);
+
             // add to destination map
             try dest.put(win_path, .{
                 .name = win_path,
                 .files = try files.toOwnedSlice(self.allocator),
             });
+            try self.shared_real_paths.put(win_path, real_path);
         }
     }
 
@@ -402,7 +423,7 @@ pub const Client = struct {
     }
 
     // Converts the internal share map representation to the proper protocol structure.
-    pub fn formatShares(self: *Client, map: *const std.StringHashMap(messages.SharedDirectory)) ![]messages.SharedDirectory {
+    fn formatShares(self: *Client, map: *const std.StringHashMap(messages.SharedDirectory)) ![]messages.SharedDirectory {
         const list = try self.allocator.alloc(messages.SharedDirectory, map.count());
         var i: usize = 0;
 
@@ -414,6 +435,223 @@ pub const Client = struct {
         }
 
         return list;
+    }
+
+    // Processes the upload queue in accordance with the number of available slots.
+    fn uploadQueueTask(self: *Client, rt: *zio.Runtime) void {
+        while (self.connection_state.load(.seq_cst) == .connected) {
+            var upload = self.upload_queue.receive(rt) catch return;
+
+            // wait for uploads to finish if slots are full
+            while (self.active_uploads.load(.seq_cst) >= self.upload_slots) {
+                rt.sleep(.fromMilliseconds(100)) catch return;
+            }
+
+            // dispatch task to handle upload
+            self.peer_group.spawn(rt, uploadTask, .{ self, rt, upload }) catch {
+                upload.deinit(self.allocator);
+                continue;
+            };
+        }
+    }
+
+    // Performs an upload to a peer.
+    fn uploadTask(self: *Client, rt: *zio.Runtime, u: types.QueuedUpload) void {
+        var upload = u; // mutable
+        // cleanup on exit
+        defer {
+            _ = self.active_uploads.fetchSub(1, .seq_cst); // decrement active upload counter
+            upload.deinit(self.allocator);
+        }
+        _ = self.active_uploads.fetchAdd(1, .seq_cst); // increment active upload counter
+
+        // get peer to upload to
+        const peer = self.getOrCreatePeer(rt, upload.username) catch |err| {
+            std.log.err("Upload to peer {s} failed getting peer: {}", .{ upload.username, err });
+            return;
+        };
+
+        // generate token to track transfer
+        var token: u32 = undefined;
+        self.io.random(std.mem.asBytes(&token));
+
+        // create oneshot channel for request-response
+        var xfer_one: [1]messages.TransferResponseMessage = undefined;
+        var xfer_channel = zio.Channel(messages.TransferResponseMessage).init(&xfer_one);
+        defer xfer_channel.close(.graceful);
+
+        // register
+        peer.channels_mutex.lock();
+        peer.transfer_response_channels.put(token, &xfer_channel) catch return;
+        peer.channels_mutex.unlock();
+
+        // unregister on exit
+        defer {
+            peer.channels_mutex.lock();
+            _ = peer.transfer_response_channels.remove(token);
+            peer.channels_mutex.unlock();
+        }
+
+        // send TransferRequest to peer
+        peer.sendPeerMessage(rt, .{
+            .transferRequest = .{
+                .direction = .uploadToPeer,
+                .token = token,
+                .filename = upload.filename,
+                .size = upload.size,
+            },
+        }) catch |err| {
+            std.log.err("Upload to peer {s} failed sending TransferRequest: {}", .{ upload.username, err });
+            return;
+        };
+
+        // block until we receive a transfer response
+        var transfer_response_msg = xfer_channel.receive(rt) catch |err| {
+            std.log.err("Upload to peer {s} failed waiting for TransferResponse: {}", .{ upload.username, err });
+            return;
+        };
+        defer transfer_response_msg.deinit(self.allocator);
+
+        // check if allowed
+        if (!transfer_response_msg.allowed) {
+            std.log.err("Upload to peer {s} failed, peer denied upload", .{upload.username});
+            return;
+        }
+
+        // establish F connection
+        const file_conn = self.establishFileConnection(rt, peer, token) catch |err| {
+            std.log.err("Upload to peer {s} failed, could not establish file connection: {}", .{ upload.username, err });
+            return;
+        };
+        defer {
+            file_conn.deinit(rt);
+            self.allocator.destroy(file_conn);
+        }
+
+        // reader for socket
+        var read_buf: [4096]u8 = undefined;
+        var reader = file_conn.socket.?.reader(rt, &read_buf);
+
+        // send FileTransferInit
+        file_conn.sendFileMessage(rt, .{ .fileTransferInit = .{ .token = token } }) catch |err| {
+            std.log.err("Upload to peer {s} failed, could not send FileTransferInit: {}", .{ upload.username, err });
+            return;
+        };
+
+        // read FileOffset
+        const file_offset_msg = file_conn.readOffsetMessage(&reader) catch |err| {
+            std.log.err("Upload to peer {s} failed, could not read FileOffset: {}", .{ upload.username, err });
+            return;
+        };
+
+        // open file to upload
+        const file = std.Io.Dir.openFileAbsolute(self.io, upload.real_path, .{ .mode = .read_only }) catch |err| {
+            std.log.err("Upload to peer {s} failed, could not open file at path {s}: {}", .{ upload.username, upload.real_path, err });
+            return;
+        };
+        defer file.close(self.io);
+
+        // reader for file
+        var file_read_buf: [4096]u8 = undefined;
+        var file_reader = file.reader(self.io, &file_read_buf);
+        file_reader.seekTo(file_offset_msg.offset) catch |err| {
+            std.log.err("Upload to peer {s} failed, could not seek file at path {s} to position {d}: {}", .{ upload.username, upload.real_path, file_offset_msg.offset, err });
+            return;
+        };
+
+        // writer for socket
+        var write_buf: [4096]u8 = undefined;
+        var writer = file_conn.socket.?.writer(rt, &write_buf);
+
+        // stream from reader to writer
+        _ = file_reader.interface.streamRemaining(&writer.interface) catch |err| {
+            std.log.err("Upload to peer {s} failed, could not stream file contents to peer: {}", .{ upload.username, err });
+            return;
+        };
+        writer.interface.flush() catch |err| {
+            std.log.err("Upload to peer {s} failed, could not flush writer: {}", .{ upload.username, err });
+            return;
+        };
+    }
+
+    // Establishes a file connection (type F) with a specified username.
+    fn establishFileConnection(self: *Client, rt: *zio.Runtime, peer: *PeerConnection, token: u32) !*FileConnection {
+        // oneshot channel to receive the FileConnection
+        var one: [1]types.ConnectionResult = undefined;
+        var channel = zio.Channel(types.ConnectionResult).init(&one);
+        defer channel.close(.graceful);
+
+        // register
+        self.indirect_mutex.lock();
+        try self.indirect_channels.put(token, &channel);
+        self.indirect_mutex.unlock();
+
+        // unregister on exit
+        defer {
+            self.indirect_mutex.lock();
+            _ = self.indirect_channels.remove(token);
+            self.indirect_mutex.unlock();
+        }
+
+        // request indirect connection
+        try self.sendMessage(rt, .{
+            .connectToPeer = .{
+                .token = token,
+                .username = peer.username,
+                .type = @tagName(types.ConnectionType.F),
+            },
+        });
+
+        // direct connection task logic
+        const DirectConnectionTask = struct {
+            fn run(client: *Client, runtime: *zio.Runtime, username: []const u8, ch: *zio.Channel(types.ConnectionResult)) void {
+                // get address of peer
+                var addr_resp = client.getPeerAddress(runtime, username) catch return;
+                defer addr_resp.deinit(client.allocator);
+
+                // attempt connection
+                const address = zio.net.IpAddress.initIp4(addr_resp.ip, @intCast(addr_resp.port));
+                const stream = zio.net.tcpConnectToAddress(runtime, address, .{
+                    .timeout = .{ .duration = .fromSeconds(20) },
+                }) catch return;
+
+                // send in channel
+                ch.trySend(.{
+                    .stream = stream,
+                    .direct = true,
+                }) catch {
+                    stream.close(runtime);
+                };
+            }
+        };
+
+        // race direct vs. indirect
+        try self.peer_group.spawn(rt, DirectConnectionTask.run, .{ self, rt, peer.username, &channel });
+
+        // grab winner
+        const result = try channel.receive(rt);
+
+        // create file connection
+        const file_conn = try FileConnection.init(self.allocator, peer.username, token);
+        file_conn.socket = result.stream;
+
+        // handshake if direct, PierceFireWall consumed in P2P listener
+        if (result.direct) {
+            // we need to send PeerInit
+            file_conn.sendPeerInitMessage(rt, .{
+                .peerInit = .{
+                    .username = self.own_username.?,
+                    .type = @tagName(types.ConnectionType.F),
+                    .token = 0,
+                },
+            }) catch {
+                file_conn.deinit(rt);
+                self.allocator.destroy(file_conn);
+                return error.HandshakeFailed;
+            };
+        }
+
+        return file_conn;
     }
 
     // P2P listener.
@@ -480,12 +718,28 @@ pub const Client = struct {
             return;
         };
 
-        //
         if (message_code == 0) {
             // PierceFireWall received, this is an outgoing indirect connection we requested
-            // TODO: unstub, handle
-            std.log.warn("Unimplemented! (outgoing_indirect)", .{});
-            stream.close(rt);
+
+            // read incoming PierceFireWall to get token
+            var pierce_firewall_msg = messages.PierceFireWall.parse(&reader.interface) catch |err| {
+                std.log.err("Error reading PierceFireWall message from incoming connection: {}", .{err});
+                stream.close(rt);
+                return;
+            };
+            defer pierce_firewall_msg.deinit(self.allocator);
+
+            // check if we're waiting for this connection
+            if (self.indirect_channels.get(pierce_firewall_msg.token)) |channel| {
+                channel.send(rt, .{
+                    .stream = stream,
+                    .direct = false,
+                }) catch stream.close(rt);
+            } else {
+                std.log.warn("Received unexpected PierceFirewall with token {d}", .{pierce_firewall_msg.token});
+                stream.close(rt);
+            }
+
             return;
         } else if (message_code == 1) {
             // PeerInit received, this is an incoming direct connection
@@ -1247,6 +1501,7 @@ pub const PeerConnection = struct {
     user_info_channel: ?*zio.Channel(messages.UserInfoMessage) = null,
     shared_file_list_channel: ?*zio.Channel(messages.SharedFileListMessage) = null,
     transfer_request_channel: ?*zio.Channel(messages.TransferRequestMessage) = null,
+    transfer_response_channels: std.AutoHashMap(u32, *zio.Channel(messages.TransferResponseMessage)),
 
     // oneshot channel for file connections socket
     file_connection_channel: ?*zio.Channel(*FileConnection) = null,
@@ -1266,6 +1521,7 @@ pub const PeerConnection = struct {
             .username = try allocator.dupe(u8, username),
             .own_username = try allocator.dupe(u8, own_username),
             .token = token,
+            .transfer_response_channels = .init(allocator),
             .connection_state = std.atomic.Value(ConnectionState).init(.connecting),
         };
         return pc;
@@ -1278,6 +1534,8 @@ pub const PeerConnection = struct {
         if (self.socket) |s| s.close(rt);
         if (self.user_info_channel) |c| c.close(.graceful);
         if (self.shared_file_list_channel) |c| c.close(.graceful);
+        if (self.transfer_request_channel) |c| c.close(.graceful);
+        self.transfer_response_channels.deinit();
     }
 
     pub fn connect(self: *PeerConnection, rt: *zio.Runtime, ip: [4]u8, port: u16) !void {
@@ -1428,7 +1686,7 @@ pub const PeerConnection = struct {
         // ask peer to queue download
         try self.sendPeerMessage(rt, .{ .queueUpload = .{ .filename = filepath } });
 
-        // block until we receive a transfer response
+        // block until we receive a transfer request
         var transfer_request_msg = try xfer_channel.receive(rt);
         defer transfer_request_msg.deinit(self.allocator);
 
@@ -1564,6 +1822,7 @@ pub const PeerConnection = struct {
             15 => .{ .getUserInfo = try messages.EmptyMessage.parse(self.allocator, &reader.interface) },
             16 => .{ .userInfo = try messages.UserInfoMessage.parse(self.allocator, &reader.interface, start_seek, payload_len) },
             40 => .{ .transferRequest = try messages.TransferRequestMessage.parse(self.allocator, &reader.interface) },
+            41 => .{ .transferResponse = try messages.TransferResponseMessage.parse(self.allocator, &reader.interface, .uploadToPeer) }, // TODO: this does not support legacy TransferResponse for queuing downloads
             43 => .{ .queueUpload = try messages.QueueUploadMessage.parse(self.allocator, &reader.interface) },
             46 => .{ .uploadFailed = try messages.UploadFailedMessage.parse(self.allocator, &reader.interface) },
             50 => .{ .uploadDenied = try messages.UploadDeniedMessage.parse(self.allocator, &reader.interface) },
@@ -1696,7 +1955,7 @@ pub const PeerConnection = struct {
                     // send request in oneshot channel, if someone is waiting
                     if (self.transfer_request_channel) |channel| {
                         channel.send(rt, msg) catch |err| {
-                            std.log.err("\tError sending transfer response in oneshot channel: {}", .{err});
+                            std.log.err("\tError sending transfer request in oneshot channel: {}", .{err});
                             should_deinit = true;
                             continue;
                         };
@@ -1704,11 +1963,81 @@ pub const PeerConnection = struct {
                 },
                 .transferResponse => |msg| {
                     std.log.debug("\tReceived transfer response from {s}: token {d}", .{ self.username, msg.token });
-                    // TODO: establish file connection now
+                    should_deinit = false;
+
+                    // send response in oneshot channel, if someone is waiting
+                    if (self.transfer_response_channels.get(msg.token)) |channel| {
+                        channel.send(rt, msg) catch |err| {
+                            std.log.err("\tError sending transfer response in oneshot channel: {}", .{err});
+                            should_deinit = true;
+                            continue;
+                        };
+                    }
                 },
                 .queueUpload => |msg| {
                     std.log.debug("\t{s} requests file '{s}'", .{ self.username, msg.filename });
-                    // TODO: send transfer request
+
+                    // get real path in local filesystem
+                    const dir_path = std.fs.path.dirnameWindows(msg.filename) orelse "";
+                    const file_name = std.fs.path.basenameWindows(msg.filename);
+                    const real_dir_path = self.client.shared_real_paths.get(dir_path) orelse {
+                        // unknown path
+                        self.sendPeerMessage(rt, .{
+                            .uploadDenied = messages.UploadDeniedMessage{
+                                .filename = msg.filename,
+                                .reason = "File not shared.",
+                            },
+                        }) catch {};
+                        continue;
+                    };
+
+                    // check target file exists
+                    const real_dir = std.Io.Dir.openDirAbsolute(self.client.io, real_dir_path, .{}) catch {
+                        self.sendPeerMessage(rt, .{ .uploadDenied = .{
+                            .filename = msg.filename,
+                            .reason = "File not shared.",
+                        } }) catch {};
+                        continue;
+                    };
+                    defer real_dir.close(self.client.io);
+                    const stat = real_dir.statFile(self.client.io, file_name, .{}) catch {
+                        self.sendPeerMessage(rt, .{ .uploadDenied = .{
+                            .filename = msg.filename,
+                            .reason = "File not shared.",
+                        } }) catch {};
+                        continue;
+                    };
+
+                    // build upload
+                    const username = self.allocator.dupe(u8, self.username) catch continue;
+                    const filename = self.allocator.dupe(u8, msg.filename) catch {
+                        self.allocator.free(username);
+                        continue;
+                    };
+                    const real_path = std.fs.path.join(self.allocator, &.{ real_dir_path, file_name }) catch {
+                        self.allocator.free(username);
+                        self.allocator.free(filename);
+                        continue;
+                    };
+                    var upload = types.QueuedUpload{
+                        .username = username,
+                        .filename = filename,
+                        .real_path = real_path,
+                        .size = stat.size,
+                    };
+
+                    // send to the upload queue dispatcher
+                    self.client.upload_queue.trySend(upload) catch {
+                        // queue is full
+                        upload.deinit(self.allocator);
+                        self.sendPeerMessage(rt, .{
+                            .uploadDenied = messages.UploadDeniedMessage{
+                                .filename = msg.filename,
+                                .reason = "Queue is full.",
+                            },
+                        }) catch {};
+                        continue;
+                    };
                 },
                 .uploadFailed => |msg| {
                     std.log.debug("\tReceived upload failure from {s}: {s}", .{ self.username, msg.filename });
