@@ -9,6 +9,10 @@ const LISTEN_PORT: u16 = 2234;
 const DEFAULT_TERM_WIDTH: u16 = 80;
 
 const Command = enum {
+    addlike, // adds a "like" entry to user profile interests (ex. addlike <entry>)
+    rmlike, // removes a "like" entry from user profile interests (ex. rmlike <entry>)
+    addhate, // adds a "hate" entry to user profile interests (ex. addhate <entry>)
+    rmhate, // removes a "hate" entry from user profile interests (ex. rmhate <entry>)
     download, // downloads a target file from a target username (ex. download <username> <filename>)
     filelist, // retrieves file list for a target username (ex. filelist <username>)
     msg, // sends a message to a target user (ex. msg <username> <content>)
@@ -75,6 +79,58 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, io
 
             if (cmd_or_null) |cmd| {
                 switch (cmd) {
+                    Command.addlike => {
+                        const entry = it.rest();
+                        if (entry.len == 0) {
+                            print(rt, "[error] syntax: addlike <entry>\n", .{});
+                            continue;
+                        }
+
+                        client.addLikeInterest(rt, entry) catch |err| {
+                            std.log.err("Could not add like interest: {}", .{err});
+                            continue;
+                        };
+                        print(rt, "Like interest added.\n", .{});
+                    },
+                    Command.rmlike => {
+                        const entry = it.rest();
+                        if (entry.len == 0) {
+                            print(rt, "[error] syntax: rmlike <entry>\n", .{});
+                            continue;
+                        }
+
+                        client.removeLikeInterest(rt, entry) catch |err| {
+                            std.log.err("Could not remove like interest: {}", .{err});
+                            continue;
+                        };
+                        print(rt, "Like interest removed.\n", .{});
+                    },
+                    Command.addhate => {
+                        const entry = it.rest();
+                        if (entry.len == 0) {
+                            print(rt, "[error] syntax: addhate <entry>\n", .{});
+                            continue;
+                        }
+
+                        client.addHateInterest(rt, entry) catch |err| {
+                            std.log.err("Could not add hate interest: {}", .{err});
+                            continue;
+                        };
+                        print(rt, "Hate interest added.\n", .{});
+                    },
+                    Command.rmhate => {
+                        const entry = it.rest();
+                        if (entry.len == 0) {
+                            print(rt, "[error] syntax: rmhate <entry>\n", .{});
+                            continue;
+                        }
+
+                        client.removeHateInterest(rt, entry) catch |err| {
+                            std.log.err("Could not remove hate interest: {}", .{err});
+                            continue;
+                        };
+                        print(rt, "Hate interest removed.\n", .{});
+                    },
                     Command.download => {
                         const user = it.next() orelse {
                             print(rt, "[error] syntax: download <username> <filename>\n", .{});

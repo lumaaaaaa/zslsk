@@ -240,6 +240,26 @@ pub const Client = struct {
         self.user_info.picture = if (picture) |p| try self.allocator.dupe(u8, p) else null;
     }
 
+    /// Adds a "like" entry to our profile's interest list.
+    pub fn addLikeInterest(self: *Client, rt: *zio.Runtime, like: []const u8) !void {
+        try self.sendMessage(rt, .{ .addThingILike = .{ .like = like } });
+    }
+
+    /// Removes a "like" entry to our profile's interest list.
+    pub fn removeLikeInterest(self: *Client, rt: *zio.Runtime, like: []const u8) !void {
+        try self.sendMessage(rt, .{ .removeThingILike = .{ .like = like } });
+    }
+
+    /// Adds a "hate" entry to our profile's interest list.
+    pub fn addHateInterest(self: *Client, rt: *zio.Runtime, hate: []const u8) !void {
+        try self.sendMessage(rt, .{ .addThingIHate = .{ .hate = hate } });
+    }
+
+    /// Removes a "hate" entry to our profile's interest list.
+    pub fn removeHateInterest(self: *Client, rt: *zio.Runtime, hate: []const u8) !void {
+        try self.sendMessage(rt, .{ .removeThingIHate = .{ .hate = hate } });
+    }
+
     /// Adds a directory to the share list. Expects path to be absolute.
     pub fn addShare(self: *Client, rt: *zio.Runtime, path: []const u8) !void {
         const dir = try std.Io.Dir.openDirAbsolute(self.io, path, .{ .iterate = true });

@@ -10,8 +10,12 @@ pub const Message = union(enum(u32)) {
     messageUser: MessageUserMessage = 22,
     messageAcked: MessageAckedMessage = 23,
     fileSearch: FileSearchMessage = 26,
+    addThingILike: AddThingILikeMessage = 51,
+    removeThingILike: RemoveThingILikeMessage = 52,
     userInterests: UserInterestsMessage = 57,
     haveNoParent: HaveNoParentMessage = 71,
+    addThingIHate: AddThingIHateMessage = 117,
+    removeThingIHate: RemoveThingIHateMessage = 118,
     uploadSpeed: UploadSpeedMessage = 121,
 
     // Returns the relevant message code based on the enum value.
@@ -104,6 +108,15 @@ pub const MessageUserMessage = struct {
     }
 };
 
+/// Represents server code 23, a message to acknowledge receipt of a user direct message.
+pub const MessageAckedMessage = struct {
+    message_id: u32,
+
+    pub fn write(self: MessageAckedMessage, writer: *std.Io.Writer) !void {
+        try writer.writeInt(u32, self.message_id, .little);
+    }
+};
+
 /// Represents server code 26, a message to represent a search query.
 pub const FileSearchMessage = struct {
     token: u32,
@@ -112,6 +125,24 @@ pub const FileSearchMessage = struct {
     pub fn write(self: FileSearchMessage, writer: *std.Io.Writer) !void {
         try writer.writeInt(u32, self.token, .little);
         try writeString(self.query, writer);
+    }
+};
+
+/// Represents server code 51, a message to add an entry to our profile's like list.
+pub const AddThingILikeMessage = struct {
+    like: []const u8,
+
+    pub fn write(self: AddThingILikeMessage, writer: *std.Io.Writer) !void {
+        try writeString(self.like, writer);
+    }
+};
+
+/// Represents server code 52, a message to remove an entry from our profile's like list.
+pub const RemoveThingILikeMessage = struct {
+    like: []const u8,
+
+    pub fn write(self: RemoveThingILikeMessage, writer: *std.Io.Writer) !void {
+        try writeString(self.like, writer);
     }
 };
 
@@ -133,12 +164,21 @@ pub const HaveNoParentMessage = struct {
     }
 };
 
-/// Represents server code 23, a message to acknowledge receipt of a user direct message.
-pub const MessageAckedMessage = struct {
-    message_id: u32,
+/// Represents server code 117, a message to add an entry to our profile's hate list.
+pub const AddThingIHateMessage = struct {
+    hate: []const u8,
 
-    pub fn write(self: MessageAckedMessage, writer: *std.Io.Writer) !void {
-        try writer.writeInt(u32, self.message_id, .little);
+    pub fn write(self: AddThingIHateMessage, writer: *std.Io.Writer) !void {
+        try writeString(self.hate, writer);
+    }
+};
+
+/// Represents server code 118, a message to remove an entry from our profile's hate list.
+pub const RemoveThingIHateMessage = struct {
+    hate: []const u8,
+
+    pub fn write(self: RemoveThingIHateMessage, writer: *std.Io.Writer) !void {
+        try writeString(self.hate, writer);
     }
 };
 
