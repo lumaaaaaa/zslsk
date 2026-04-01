@@ -12,8 +12,10 @@ const Command = enum {
     download, // downloads a target file from a target username (ex. download <username> <filename>)
     filelist, // retrieves file list for a target username (ex. filelist <username>)
     msg, // sends a message to a target user (ex. msg <username> <content>)
-    share, // adds a local directory to the share list (ex. share <abs path>)
     search, // searches network for files matching a target query (ex. search <query>)
+    setbio, // sets biography for user profile (ex. setbio <content>)
+    setpic, // sets picture for user profile. argument can be omitted to unset (ex. setpic <path to pic or null>)
+    share, // adds a local directory to the share list (ex. share <abs path>)
     userinfo, // retrieves user info for a target username (ex. userinfo <username>)
     exit, // exits the application
 };
@@ -182,17 +184,36 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, io
                         };
                         print(rt, "Message sent.\n", .{});
                     },
-                    Command.share => {
-                        const path = it.rest();
-                        if (path.len == 0) {
-                            print(rt, "[error] syntax: share <abs path>\n", .{});
-                            continue;
-                        }
-                        client.addShare(rt, path) catch |err| {
-                            std.log.err("Could not add share: {}", .{err});
+                    Command.setbio => {
+                        const bio = it.rest();
+                        client.setDescription(bio) catch |err| {
+                            std.log.err("Could not set bio: {}", .{err});
                             continue;
                         };
-                        print(rt, "Share added.\n", .{});
+                        print(rt, "Bio set.\n", .{});
+                    },
+                    Command.setpic => {
+                        const path = it.rest();
+                        if (path.len == 0) {
+                            client.setPicture(null) catch |err| {
+                                std.log.err("Could not unset picture: {}", .{err});
+                                continue;
+                            };
+                            print(rt, "Picture unset.\n", .{});
+                            continue;
+                        }
+
+                        const picture = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch |err| {
+                            print(rt, "[error] could not read file: {}\n", .{err});
+                            continue;
+                        };
+                        defer allocator.free(picture);
+
+                        client.setPicture(picture) catch |err| {
+                            std.log.err("Could not set picture: {}", .{err});
+                            continue;
+                        };
+                        print(rt, "Picture set.\n", .{});
                     },
                     Command.search => {
                         const query = it.rest();
@@ -207,6 +228,18 @@ fn app(rt: *zio.Runtime, client: *zslsk.Client, allocator: std.mem.Allocator, io
                         };
 
                         _ = try client_group.spawn(rt, printSearchResults, .{ rt, allocator, channel });
+                    },
+                    Command.share => {
+                        const path = it.rest();
+                        if (path.len == 0) {
+                            print(rt, "[error] syntax: share <abs path>\n", .{});
+                            continue;
+                        }
+                        client.addShare(rt, path) catch |err| {
+                            std.log.err("Could not add share: {}", .{err});
+                            continue;
+                        };
+                        print(rt, "Share added.\n", .{});
                     },
                     Command.userinfo => {
                         const user = it.next() orelse {

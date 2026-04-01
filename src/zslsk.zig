@@ -54,7 +54,7 @@ pub const Client = struct {
     shared_real_paths: std.StringHashMap([]const u8),
     shared_dirs: std.StringHashMap(messages.SharedDirectory),
     shared_priv_dirs: std.StringHashMap(messages.SharedDirectory),
-    user_info: types.UserInfoConfig = .{ .description = "hello from https://github.com/lumaaaaaa/zslsk", .picture = null },
+    user_info: types.UserInfoConfig,
 
     // group for peer task execution
     peer_group: zio.Group = .init,
@@ -81,6 +81,10 @@ pub const Client = struct {
             .shared_real_paths = .init(allocator),
             .shared_dirs = .init(allocator),
             .shared_priv_dirs = .init(allocator),
+            .user_info = .{
+                .description = try allocator.dupe(u8, "hello from https://github.com/lumaaaaaa/zslsk"), // heap allocate bio
+                .picture = null,
+            },
             .distributed_connections = .init(allocator),
             .get_peer_address_channels = .init(allocator),
             .user_interests_channels = .init(allocator),
@@ -99,6 +103,8 @@ pub const Client = struct {
             self.allocator.destroy(entry.value_ptr.channel);
         }
         self.search_result_channels.deinit();
+        self.allocator.free(self.user_info.description);
+        if (self.user_info.picture) |p| self.allocator.free(p);
 
         self.peers.deinit();
         self.distributed_connections.deinit();
@@ -219,6 +225,19 @@ pub const Client = struct {
         self.peers_mutex.unlock();
 
         self.peer_group.cancel(rt);
+    }
+
+    /// Sets profile description in user info.
+    pub fn setDescription(self: *Client, description: []const u8) !void {
+        const dupe = try self.allocator.dupe(u8, description);
+        self.allocator.free(self.user_info.description);
+        self.user_info.description = dupe;
+    }
+
+    /// Sets profile picture in user info.
+    pub fn setPicture(self: *Client, picture: ?[]const u8) !void {
+        if (self.user_info.picture) |p| self.allocator.free(p);
+        self.user_info.picture = if (picture) |p| try self.allocator.dupe(u8, p) else null;
     }
 
     /// Adds a directory to the share list. Expects path to be absolute.
