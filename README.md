@@ -15,10 +15,17 @@ The library is under active development, and many features are currently missing
 > zslsk is only confirmed to build with Zig version `0.16.0-dev.2459+37d14a4f3`. I know this is suboptimal, but [this issue](https://github.com/lumaaaaaa/zslsk/issues/24) explains what the situation is and track the status of it. The goal is to move to Zig 0.16.0 when it is released.
 
 - [x] Basic app (in `main.zig`) demonstrating use of library with following commands:
+  - `addlike`
+  - `rmlike`
+  - `addhate`
+  - `rmhate`
   - `download`
   - `filelist`
   - `msg`
+  - `setbio`
+  - `setpic`
   - `search`
+  - `share`
   - `userinfo`
   - `exit`
 - [x] Asynchronous library initialization (via `client.run(rt, HOST, PORT, username, password, LISTEN_PORT)`
@@ -30,6 +37,8 @@ The library is under active development, and many features are currently missing
   - `MessageUser`
   - `MessageAcked`
   - `FileSearch`
+  - `AddThingILike`
+  - `RemoveThingILike`
   - `UserInterests`
   - `RoomList`
   - `PrivilegedUsers`
@@ -37,6 +46,8 @@ The library is under active development, and many features are currently missing
   - `ParentSpeedRatio`
   - `WishlistSearch`
   - `ExcludedSearchPhrases`
+  - `AddThingIHate`
+  - `RemoveThingIHate`
   - `UploadSpeed`
 - [x] Peer message parse/write:
   - `PeerInit`
